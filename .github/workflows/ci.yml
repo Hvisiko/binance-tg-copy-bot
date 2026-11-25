@@ -17,4 +17,4 @@ jobs:
       - name: Compile and run unit tests
         run: |
           python -m compileall src tests
-          pytest -v
+          python -m pytest -v
