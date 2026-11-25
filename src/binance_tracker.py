@@ -56,6 +56,26 @@ class TraderOrderFill:
     realized_pnl: float
     order_time_ms: int
 
+    def infer_action_and_pos_side(self) -> Tuple[str, str]:
+        """
+        Infer ('OPEN' | 'CLOSE', 'LONG' | 'SHORT') from a single executed trade record.
+        """
+        s = self.side.upper()
+        ps = self.position_side.upper()
+        has_realized = abs(self.realized_pnl) > 1e-9
+
+        if ps in ("LONG", "SHORT"):
+            is_open = (s == "BUY" and ps == "LONG") or (s == "SELL" and ps == "SHORT")
+            return ("OPEN" if is_open else "CLOSE"), ps
+
+        # One-way mode ("BOTH" or empty): non-zero realized PnL indicates closing an existing position
+        if has_realized:
+            inferred_ps = "LONG" if s == "SELL" else "SHORT"
+            return "CLOSE", inferred_ps
+
+        inferred_ps = "LONG" if s == "BUY" else "SHORT"
+        return "OPEN", inferred_ps
+
 
 @dataclass
 class PositionEvent:
@@ -67,13 +87,16 @@ class PositionEvent:
     prev_qty: float
     curr_qty: float
     delta_qty: float
-    ref_price: float  # Reference price for display & limit order calculation
+    ref_price: float  # Executed trade price for display & limit order calculation
     entry_price: float
     mark_price: float
     leverage: int
     unrealized_pnl: float = 0.0
     realized_pnl: Optional[float] = None
     event_time_ms: int = 0
+    order_side: str = ""  # "BUY" or "SELL"
+    order_type: str = "LIMIT"
+    order_id: str = ""
 
 
 def _safe_float(val: Any, default: Optional[float] = 0.0) -> Optional[float]:
@@ -99,6 +122,32 @@ def _safe_int(val: Any, default: int = 0) -> int:
         return default
 
 
+def fill_to_event(
+    portfolio_id: str, trader_name: str, fill: TraderOrderFill, default_leverage: int = 10
+) -> PositionEvent:
+    action, p_side = fill.infer_action_and_pos_side()
+    is_opening = action == "OPEN"
+    return PositionEvent(
+        portfolio_id=portfolio_id,
+        trader_name=trader_name,
+        action=action,
+        symbol=fill.symbol,
+        position_side=p_side,
+        prev_qty=0.0 if is_opening else fill.executed_qty,
+        curr_qty=fill.executed_qty if is_opening else 0.0,
+        delta_qty=fill.executed_qty,
+        ref_price=fill.avg_price,
+        entry_price=fill.avg_price,
+        mark_price=fill.avg_price,
+        leverage=default_leverage,
+        realized_pnl=fill.realized_pnl if (not is_opening or abs(fill.realized_pnl) > 1e-9) else None,
+        event_time_ms=fill.order_time_ms,
+        order_side=fill.side,
+        order_type=fill.order_type,
+        order_id=fill.order_id,
+    )
+
+
 def diff_positions(
     portfolio_id: str,
     trader_name: str,
@@ -107,7 +156,7 @@ def diff_positions(
     recent_fills: Optional[List[TraderOrderFill]] = None,
     eps: float = 1e-9,
 ) -> List[PositionEvent]:
-    """Compare previous and current open positions to emit precise trade events."""
+    """Compare previous and current open positions (kept for legacy UID compatibility & tests)."""
     events: List[PositionEvent] = []
     now_ms = int(time.time() * 1000)
     fills = recent_fills or []
@@ -239,7 +288,7 @@ def diff_positions(
 
 
 class BinanceCopyTracker:
-    """Monitors Binance Copy-Trading Lead Portfolios (and legacy Leaderboard UIDs)."""
+    """Monitors Binance Copy-Trading Lead Portfolios directly via their Latest Trade / Order History."""
 
     def __init__(self, cookie: str = "", client: Optional[httpx.AsyncClient] = None) -> None:
         headers = {
@@ -264,9 +313,9 @@ class BinanceCopyTracker:
 
         # Runtime baseline & tracking state per portfolio_id
         self._initialized: Dict[str, bool] = {}
-        self._positions_cache: Dict[str, Dict[Tuple[str, str], TraderPosition]] = {}
         self._seen_order_ids: Dict[str, set[str]] = {}
         self._last_order_time_ms: Dict[str, int] = {}
+        self._positions_cache: Dict[str, Dict[Tuple[str, str], TraderPosition]] = {}
 
     async def close(self) -> None:
         if self._owns_client:
@@ -402,114 +451,167 @@ class BinanceCopyTracker:
         )
 
     @staticmethod
-    def _parse_position_rows(raw_rows: List[Dict[str, Any]]) -> List[TraderPosition]:
-        parsed: List[TraderPosition] = []
-        for item in raw_rows:
-            if not isinstance(item, dict):
-                continue
-            symbol = str(item.get("symbol") or "").strip().upper()
+    def _extract_list_rows(data: Any) -> Optional[List[Dict[str, Any]]]:
+        if isinstance(data, list):
+            return [r for r in data if isinstance(r, dict)]
+        if isinstance(data, dict):
+            for key in ("list", "rows", "owsOrderList", "orders", "trades", "data"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    return [r for r in val if isinstance(r, dict)]
+        return None
+
+    @staticmethod
+    def _parse_fill_rows(rows: List[Dict[str, Any]]) -> List[TraderOrderFill]:
+        fills: List[TraderOrderFill] = []
+        for r in rows:
+            symbol = str(r.get("symbol") or r.get("pair") or "").strip().upper()
             if not symbol:
                 continue
-            raw_amt_field = (
-                item.get("positionAmount")
-                if item.get("positionAmount") is not None
-                else item.get("positionAmt")
-                if item.get("positionAmt") is not None
-                else item.get("amount")
+            qty_raw = (
+                r.get("executedQty")
+                if r.get("executedQty") is not None
+                else r.get("qty")
+                if r.get("qty") is not None
+                else r.get("amount")
+                if r.get("amount") is not None
+                else r.get("volume")
             )
-            raw_amt = _safe_float_val(raw_amt_field, 0.0)
-            if abs(raw_amt) <= 1e-9:
+            qty = abs(_safe_float_val(qty_raw, 0.0))
+            if qty <= 1e-9:
                 continue
 
-            raw_side = str(
-                item.get("positionSide") or item.get("side") or ""
-            ).strip().upper()
-            if raw_side in ("LONG", "BUY"):
-                p_side = "LONG" if raw_amt >= 0 else "SHORT"
-                qty = abs(raw_amt)
-            elif raw_side in ("SHORT", "SELL"):
-                p_side = "SHORT"
-                qty = abs(raw_amt)
-            else:
-                p_side = "LONG" if raw_amt > 0 else "SHORT"
-                qty = abs(raw_amt)
+            price_raw = (
+                r.get("avgPrice")
+                if _safe_float_val(r.get("avgPrice"), 0.0) > 0
+                else r.get("price")
+                if _safe_float_val(r.get("price"), 0.0) > 0
+                else r.get("avgCost")
+            )
+            avg_p = _safe_float_val(price_raw, 0.0)
+            if avg_p <= 0:
+                continue
 
-            entry_price = _safe_float_val(
-                item.get("entryPrice")
-                if item.get("entryPrice") is not None
-                else item.get("openPrice"),
-                0.0,
+            ts_raw = (
+                r.get("orderTime")
+                or r.get("time")
+                or r.get("tradeTime")
+                or r.get("orderUpdateTime")
+                or r.get("updateTime")
             )
-            mark_price = _safe_float_val(item.get("markPrice"), entry_price)
-            upnl_field = (
-                item.get("unrealizedProfit")
-                if item.get("unrealizedProfit") is not None
-                else item.get("unRealizedProfit")
-                if item.get("unRealizedProfit") is not None
-                else item.get("pnl")
-            )
-            upnl = _safe_float_val(upnl_field, 0.0)
-            leverage = max(1, _safe_int(item.get("leverage"), 10))
-            isolated_flag = item.get("isolated")
-            margin_type = (
-                "isolated"
-                if isolated_flag is True
-                or str(item.get("marginType", "")).lower() == "isolated"
-                else "cross"
-            )
+            ts = _safe_int(ts_raw, 0)
 
-            parsed.append(
-                TraderPosition(
+            side = str(r.get("side") or r.get("action") or "").strip().upper()
+            pos_side = str(r.get("positionSide") or "BOTH").strip().upper()
+            if side not in ("BUY", "SELL"):
+                if pos_side == "SHORT":
+                    side = "SELL"
+                else:
+                    side = "BUY"
+
+            pnl_raw = (
+                r.get("totalPnl")
+                if r.get("totalPnl") is not None
+                else r.get("realizedPnl")
+                if r.get("realizedPnl") is not None
+                else r.get("realizedProfit")
+                if r.get("realizedProfit") is not None
+                else r.get("pnl")
+            )
+            rpnl = _safe_float_val(pnl_raw, 0.0)
+
+            oid = str(
+                r.get("orderId")
+                or r.get("tradeId")
+                or r.get("id")
+                or f"{symbol}-{side}-{pos_side}-{ts}-{qty:g}-{avg_p:g}"
+            )
+            otype = str(r.get("type") or r.get("orderType") or "LIMIT").strip().upper()
+
+            fills.append(
+                TraderOrderFill(
+                    order_id=oid,
                     symbol=symbol,
-                    position_side=p_side,
-                    position_amt=qty,
-                    entry_price=entry_price,
-                    mark_price=mark_price,
-                    unrealized_pnl=upnl,
-                    leverage=leverage,
-                    margin_type=margin_type,
+                    side=side,
+                    position_side=pos_side,
+                    order_type=otype,
+                    avg_price=avg_p,
+                    executed_qty=qty,
+                    realized_pnl=rpnl,
+                    order_time_ms=ts,
                 )
             )
-        return parsed
+        return fills
 
-    async def fetch_positions(self, portfolio_id: str) -> Optional[List[TraderPosition]]:
-        """Fetch active open positions across all Binance Copy-Trading & Leaderboard routes."""
+    async def fetch_recent_orders(
+        self, portfolio_id: str, limit: int = 20
+    ) -> Optional[List[TraderOrderFill]]:
+        """
+        Fetch latest executed trade / order history records for a Copy-Trading portfolio.
+        Returns:
+          - List[TraderOrderFill] sorted ascending by order_time_ms (oldest -> newest) when reachable
+          - None if all history endpoints were unreachable / unauthorized
+        """
         if portfolio_id.startswith("uid:"):
-            uid = portfolio_id.split(":", 1)[1]
-            for base in (LEADERBOARD_PUBLIC_V2, LEADERBOARD_PUBLIC_V1):
+            return None
+
+        now_ms = int(time.time() * 1000)
+        start_30d_ms = now_ms - 30 * 86400 * 1000
+        payload_with_time = {
+            "portfolioId": portfolio_id,
+            "startTime": start_30d_ms,
+            "endTime": now_ms,
+            "pageSize": limit,
+            "pageNumber": 1,
+        }
+        payload_paged = {
+            "portfolioId": portfolio_id,
+            "pageNumber": 1,
+            "pageSize": limit,
+        }
+
+        trade_and_order_urls = [
+            f"{COPY_TRADE_FRIENDLY}/lead-portfolio/trade-history",
+            f"{COPY_TRADE_PUBLIC}/lead-portfolio/trade-history",
+            f"{COPY_TRADE_FRIENDLY}/lead-data/trade-history",
+            f"{COPY_TRADE_FRIENDLY}/lead-portfolio/order-history",
+            f"{COPY_TRADE_PUBLIC}/lead-portfolio/order-history",
+            f"{COPY_TRADE_FRIENDLY}/lead-data/order-history",
+        ]
+
+        saw_valid_empty = False
+
+        for url in trade_and_order_urls:
+            for req_body in (payload_with_time, payload_paged):
                 try:
-                    resp = await self.client.post(
-                        f"{base}/getOtherPosition",
-                        json={"encryptedUid": uid, "tradeType": "PERPETUAL"},
-                    )
+                    resp = await self.client.post(url, json=req_body)
                     if resp.status_code != 200:
                         continue
                     body = resp.json()
-                    if (
-                        str(body.get("code", "000000")) != "000000"
-                        and body.get("success") is False
+                    if body.get("success") is False or (
+                        body.get("code") and str(body.get("code")) != "000000"
                     ):
                         continue
-                    data = body.get("data") or {}
-                    rows = data.get("otherPositionRetList")
-                    if isinstance(rows, list):
-                        return self._parse_position_rows(rows)
+                    rows = self._extract_list_rows(body.get("data"))
+                    if rows is None:
+                        continue
+                    if not rows:
+                        saw_valid_empty = True
+                        break
+                    fills = self._parse_fill_rows(rows)
+                    if fills:
+                        fills.sort(key=lambda x: x.order_time_ms)
+                        return fills
+                    saw_valid_empty = True
+                    break
                 except Exception as exc:
-                    logger.debug("Leaderboard getOtherPosition failed: %s", exc)
-            return None
+                    logger.debug("fetch_recent_orders error (%s): %s", url, exc)
 
-        # Try both primary `lead-data/positions` and `lead-portfolio/positions` endpoints
-        candidate_urls = [
-            f"{COPY_TRADE_FRIENDLY}/lead-data/positions",
-            f"{COPY_TRADE_PUBLIC}/lead-data/positions",
-            f"{COPY_TRADE_FRIENDLY}/lead-portfolio/positions",
-            f"{COPY_TRADE_PUBLIC}/lead-portfolio/positions",
-        ]
-        for url in candidate_urls:
+        # Fallback: check position-history (emits opening + closing records from historical positions)
+        for base in (COPY_TRADE_FRIENDLY, COPY_TRADE_PUBLIC):
+            url = f"{base}/lead-portfolio/position-history"
             try:
-                resp = await self.client.get(url, params={"portfolioId": portfolio_id})
-                if resp.status_code in (404, 405):
-                    resp = await self.client.post(url, json={"portfolioId": portfolio_id})
+                resp = await self.client.post(url, json=payload_paged)
                 if resp.status_code != 200:
                     continue
                 body = resp.json()
@@ -517,249 +619,172 @@ class BinanceCopyTracker:
                     body.get("code") and str(body.get("code")) != "000000"
                 ):
                     continue
-                data = body.get("data")
-                if isinstance(data, list):
-                    return self._parse_position_rows(data)
-                if isinstance(data, dict):
-                    rows = (
-                        data.get("positions")
-                        if isinstance(data.get("positions"), list)
-                        else data.get("list")
-                        if isinstance(data.get("list"), list)
-                        else data.get("otherPositionRetList")
-                    )
-                    if isinstance(rows, list):
-                        return self._parse_position_rows(rows)
-                if data is None and str(body.get("code", "")) == "000000":
-                    return []
-            except Exception as exc:
-                logger.debug("fetch_positions error (%s): %s", url, exc)
-        return None
-
-    async def fetch_recent_orders(
-        self, portfolio_id: str, limit: int = 15
-    ) -> List[TraderOrderFill]:
-        """Fetch recent executed order fills (with position-history fallback) for a Copy-Trading portfolio."""
-        if portfolio_id.startswith("uid:"):
-            return []
-
-        now_ms = int(time.time() * 1000)
-        start_ms = now_ms - 24 * 3600 * 1000
-        payload = {
-            "portfolioId": portfolio_id,
-            "startTime": start_ms,
-            "endTime": now_ms,
-            "pageSize": limit,
-        }
-        for base in (COPY_TRADE_FRIENDLY, COPY_TRADE_PUBLIC):
-            url = f"{base}/lead-portfolio/order-history"
-            try:
-                resp = await self.client.post(url, json=payload)
-                if resp.status_code != 200:
+                rows = self._extract_list_rows(body.get("data"))
+                if rows is None:
                     continue
-                body = resp.json()
-                data = body.get("data")
-                rows: List[Dict[str, Any]] = []
-                if isinstance(data, dict):
-                    rows = (
-                        data.get("list")
-                        or data.get("owsOrderList")
-                        or data.get("orders")
-                        or []
-                    )
-                elif isinstance(data, list):
-                    rows = data
-
-                if not isinstance(rows, list):
+                if not rows:
+                    saw_valid_empty = True
                     continue
-
                 fills: List[TraderOrderFill] = []
                 for r in rows:
-                    if not isinstance(r, dict):
-                        continue
-                    qty = _safe_float_val(r.get("executedQty") or r.get("qty"), 0.0)
-                    if qty <= 0:
-                        continue
-                    avg_p = _safe_float_val(r.get("avgPrice") or r.get("price"), 0.0)
-                    ts = _safe_int(
-                        r.get("orderTime") or r.get("orderUpdateTime") or r.get("time"), 0
-                    )
-                    oid = str(
-                        r.get("orderId")
-                        or r.get("id")
-                        or f"{r.get('symbol')}-{r.get('side')}-{ts}-{qty}"
-                    )
-                    side = str(r.get("side") or "").upper()
-                    pos_side = str(r.get("positionSide") or "BOTH").upper()
-                    fills.append(
-                        TraderOrderFill(
-                            order_id=oid,
-                            symbol=str(r.get("symbol") or "").upper(),
-                            side=side,
-                            position_side=pos_side,
-                            order_type=str(r.get("type") or "MARKET").upper(),
-                            avg_price=avg_p,
-                            executed_qty=qty,
-                            realized_pnl=_safe_float_val(
-                                r.get("totalPnl")
-                                if r.get("totalPnl") is not None
-                                else r.get("realizedPnl"),
-                                0.0,
-                            ),
-                            order_time_ms=ts,
-                        )
-                    )
-                if fills:
-                    fills.sort(key=lambda x: x.order_time_ms)
-                    return fills
-            except Exception as exc:
-                logger.debug("fetch_recent_orders error (%s): %s", url, exc)
-
-        # Fallback: check closed position-history if order-history was empty or hidden
-        pos_hist_payload = {
-            "portfolioId": portfolio_id,
-            "pageNumber": 1,
-            "pageSize": min(10, limit),
-        }
-        for base in (COPY_TRADE_FRIENDLY, COPY_TRADE_PUBLIC):
-            url = f"{base}/lead-portfolio/position-history"
-            try:
-                resp = await self.client.post(url, json=pos_hist_payload)
-                if resp.status_code != 200:
-                    continue
-                body = resp.json()
-                data = body.get("data")
-                rows = data.get("list") if isinstance(data, dict) else data
-                if not isinstance(rows, list) or not rows:
-                    continue
-                fills = []
-                for r in rows:
-                    if not isinstance(r, dict):
-                        continue
-                    closed_ts = _safe_int(r.get("closedTime") or r.get("updateTime"), 0)
-                    if closed_ts <= 0:
-                        continue
-                    qty = _safe_float_val(
-                        r.get("closedVolume") or r.get("maxOpenInterest"), 0.0
-                    )
-                    close_p = _safe_float_val(r.get("avgClosePrice"), 0.0)
-                    if qty <= 0 or close_p <= 0:
+                    symbol = str(r.get("symbol") or "").strip().upper()
+                    if not symbol:
                         continue
                     p_side = str(r.get("side") or r.get("positionSide") or "LONG").upper()
                     if p_side not in ("LONG", "SHORT"):
                         p_side = "LONG"
-                    close_order_side = "SELL" if p_side == "LONG" else "BUY"
-                    oid = str(r.get("id") or f"poshist-{r.get('symbol')}-{p_side}-{closed_ts}")
-                    fills.append(
-                        TraderOrderFill(
-                            order_id=oid,
-                            symbol=str(r.get("symbol") or "").upper(),
-                            side=close_order_side,
-                            position_side=p_side,
-                            order_type="MARKET",
-                            avg_price=close_p,
-                            executed_qty=qty,
-                            realized_pnl=_safe_float_val(r.get("closingPnl"), 0.0),
-                            order_time_ms=closed_ts,
+                    opened_ts = _safe_int(r.get("opened") or r.get("openTime"), 0)
+                    closed_ts = _safe_int(r.get("closed") or r.get("closedTime") or r.get("updateTime"), 0)
+                    qty = abs(
+                        _safe_float_val(
+                            r.get("closedVolume") or r.get("maxOpenInterest") or r.get("volume"),
+                            0.0,
                         )
                     )
+                    open_p = _safe_float_val(r.get("avgCost") or r.get("entryPrice"), 0.0)
+                    close_p = _safe_float_val(r.get("avgClosePrice"), 0.0)
+                    row_id = str(r.get("id") or f"{symbol}-{p_side}-{opened_ts}")
+
+                    if opened_ts > 0 and open_p > 0 and qty > 0:
+                        open_order_side = "BUY" if p_side == "LONG" else "SELL"
+                        fills.append(
+                            TraderOrderFill(
+                                order_id=f"open-{row_id}",
+                                symbol=symbol,
+                                side=open_order_side,
+                                position_side=p_side,
+                                order_type="LIMIT",
+                                avg_price=open_p,
+                                executed_qty=qty,
+                                realized_pnl=0.0,
+                                order_time_ms=opened_ts,
+                            )
+                        )
+                    if closed_ts > 0 and close_p > 0 and qty > 0:
+                        close_order_side = "SELL" if p_side == "LONG" else "BUY"
+                        fills.append(
+                            TraderOrderFill(
+                                order_id=f"close-{row_id}",
+                                symbol=symbol,
+                                side=close_order_side,
+                                position_side=p_side,
+                                order_type="MARKET",
+                                avg_price=close_p,
+                                executed_qty=qty,
+                                realized_pnl=_safe_float_val(r.get("closingPnl"), 0.0),
+                                order_time_ms=closed_ts,
+                            )
+                        )
                 if fills:
                     fills.sort(key=lambda x: x.order_time_ms)
                     return fills
+                saw_valid_empty = True
             except Exception as exc:
                 logger.debug("position-history fallback error (%s): %s", url, exc)
 
-        return []
+        return [] if saw_valid_empty else None
+
+    async def fetch_positions(self, portfolio_id: str) -> Optional[List[TraderPosition]]:
+        """Optional helper for legacy encryptedUid leaderboard accounts that have no order-history."""
+        if not portfolio_id.startswith("uid:"):
+            return None
+        uid = portfolio_id.split(":", 1)[1]
+        for base in (LEADERBOARD_PUBLIC_V2, LEADERBOARD_PUBLIC_V1):
+            try:
+                resp = await self.client.post(
+                    f"{base}/getOtherPosition",
+                    json={"encryptedUid": uid, "tradeType": "PERPETUAL"},
+                )
+                if resp.status_code != 200:
+                    continue
+                body = resp.json()
+                data = body.get("data") or {}
+                rows = data.get("otherPositionRetList")
+                if isinstance(rows, list):
+                    parsed: List[TraderPosition] = []
+                    for item in rows:
+                        sym = str(item.get("symbol") or "").upper()
+                        amt = _safe_float_val(item.get("amount"), 0.0)
+                        if not sym or abs(amt) <= 1e-9:
+                            continue
+                        parsed.append(
+                            TraderPosition(
+                                symbol=sym,
+                                position_side="LONG" if amt > 0 else "SHORT",
+                                position_amt=abs(amt),
+                                entry_price=_safe_float_val(item.get("entryPrice"), 0.0),
+                                mark_price=_safe_float_val(item.get("markPrice"), 0.0),
+                                unrealized_pnl=_safe_float_val(item.get("pnl"), 0.0),
+                                leverage=max(1, _safe_int(item.get("leverage"), 10)),
+                            )
+                        )
+                    return parsed
+            except Exception:
+                pass
+        return None
 
     def remove_portfolio_state(self, portfolio_id: str) -> None:
         self._initialized.pop(portfolio_id, None)
-        self._positions_cache.pop(portfolio_id, None)
         self._seen_order_ids.pop(portfolio_id, None)
         self._last_order_time_ms.pop(portfolio_id, None)
+        self._positions_cache.pop(portfolio_id, None)
 
     async def poll_portfolio(
         self, portfolio_id: str, trader_name: str
-    ) -> Tuple[bool, List[PositionEvent], Optional[List[TraderPosition]]]:
+    ) -> Tuple[bool, List[PositionEvent], Optional[List[TraderOrderFill]]]:
         """
-        Poll a single trader once.
-        Returns: (was_initial_baseline, emitted_events, current_positions)
+        Poll a single trader's latest executed trade / order records!
+        Returns: (was_initial_baseline, emitted_events, recent_fills)
         """
-        positions = await self.fetch_positions(portfolio_id)
-        fills = await self.fetch_recent_orders(portfolio_id)
+        # Legacy leaderboard UID fallback
+        if portfolio_id.startswith("uid:"):
+            positions = await self.fetch_positions(portfolio_id)
+            is_first_uid = not self._initialized.get(portfolio_id, False)
+            if is_first_uid:
+                if positions is None:
+                    return (True, [], None)
+                self._initialized[portfolio_id] = True
+                self._positions_cache[portfolio_id] = {p.key: p for p in positions}
+                return (True, [], [])
+            if positions is None:
+                return (False, [], None)
+            prev_map = self._positions_cache.get(portfolio_id, {})
+            curr_map = {p.key: p for p in positions}
+            evs = diff_positions(portfolio_id, trader_name, prev_map, curr_map)
+            self._positions_cache[portfolio_id] = curr_map
+            return (False, evs, [])
 
+        fills = await self.fetch_recent_orders(portfolio_id, limit=20)
         is_first = not self._initialized.get(portfolio_id, False)
         seen_ids = self._seen_order_ids.setdefault(portfolio_id, set())
 
         if is_first:
-            if positions is None and not fills:
+            if fills is None:
                 return (True, [], None)
             self._initialized[portfolio_id] = True
-            if positions is not None:
-                self._positions_cache[portfolio_id] = {p.key: p for p in positions}
             baseline_ts = int(time.time() * 1000)
             for f in fills:
                 seen_ids.add(f.order_id)
                 baseline_ts = max(baseline_ts, f.order_time_ms)
             self._last_order_time_ms[portfolio_id] = baseline_ts
-            return (True, [], positions if positions is not None else [])
+            return (True, [], fills)
 
-        new_fills: List[TraderOrderFill] = []
-        baseline_cutoff = self._last_order_time_ms.get(portfolio_id, 0) - 60_000
+        if fills is None:
+            return (False, [], None)
+
+        events: List[PositionEvent] = []
+        # Allow 5-minute clock-skew / delayed settlement window, deduplicated strictly by seen_ids
+        baseline_cutoff = self._last_order_time_ms.get(portfolio_id, 0) - 300_000
         for f in fills:
             if f.order_id not in seen_ids and f.order_time_ms >= baseline_cutoff:
                 seen_ids.add(f.order_id)
-                new_fills.append(f)
                 if f.order_time_ms > self._last_order_time_ms.get(portfolio_id, 0):
                     self._last_order_time_ms[portfolio_id] = f.order_time_ms
+                events.append(fill_to_event(portfolio_id, trader_name, f))
 
-        if len(seen_ids) > 500:
+        if len(seen_ids) > 600:
+            # Retain recent order IDs so memory never grows unbounded
             recent_keep = {f.order_id for f in fills}
             self._seen_order_ids[portfolio_id] = recent_keep
 
-        events: List[PositionEvent] = []
-        handled_symbols_sides: set[Tuple[str, str]] = set()
-
-        if positions is not None:
-            prev_map = self._positions_cache.get(portfolio_id, {})
-            curr_map = {p.key: p for p in positions}
-            events = diff_positions(portfolio_id, trader_name, prev_map, curr_map, new_fills)
-            self._positions_cache[portfolio_id] = curr_map
-            for ev in events:
-                handled_symbols_sides.add((ev.symbol, ev.position_side))
-
-        # Fallback / Fast-scalp detection: if trader hid open positions OR opened & closed between polls
-        for f in new_fills:
-            inferred_pside = f.position_side
-            if inferred_pside not in ("LONG", "SHORT"):
-                if abs(f.realized_pnl) > 1e-9:
-                    inferred_pside = "LONG" if f.side == "SELL" else "SHORT"
-                else:
-                    inferred_pside = "LONG" if f.side == "BUY" else "SHORT"
-
-            if (f.symbol, inferred_pside) in handled_symbols_sides:
-                continue
-
-            is_opening = (f.side == "BUY" and inferred_pside == "LONG") or (
-                f.side == "SELL" and inferred_pside == "SHORT"
-            )
-            action = "OPEN" if is_opening else "CLOSE"
-            events.append(
-                PositionEvent(
-                    portfolio_id=portfolio_id,
-                    trader_name=trader_name,
-                    action=action,
-                    symbol=f.symbol,
-                    position_side=inferred_pside,
-                    prev_qty=0.0 if is_opening else f.executed_qty,
-                    curr_qty=f.executed_qty if is_opening else 0.0,
-                    delta_qty=f.executed_qty,
-                    ref_price=f.avg_price,
-                    entry_price=f.avg_price,
-                    mark_price=f.avg_price,
-                    leverage=10,
-                    realized_pnl=f.realized_pnl if not is_opening else None,
-                    event_time_ms=f.order_time_ms,
-                )
-            )
-
-        return (False, events, positions)
+        return (False, events, fills)
