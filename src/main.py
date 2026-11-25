@@ -130,7 +130,8 @@ async def trader_monitor_loop(
             cfg.tracked_portfolios[pid] = prof.nickname
             cfg.save_state()
 
-    if cfg.telegram_bot_token and cfg.telegram_chat_id:
+    notify_startup = os.getenv("NOTIFY_ON_STARTUP", "false").lower() in ("1", "true", "yes", "on")
+    if notify_startup and cfg.telegram_bot_token and cfg.telegram_chat_id:
         mode_note = "🟢 自動限價跟單＋通知" if cfg.enable_auto_trade else "🔔 純即時交易通知（免 API Key）"
         await bot.send_message(
             f"🚀 <b>幣安追蹤機器人已於雲端啟動！</b>\n"
