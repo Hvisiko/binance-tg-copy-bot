@@ -93,7 +93,7 @@ class TestBinanceCopyBotSuite(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ev_open[0].ref_price, 92000.0)
 
         html_msg = format_position_event_html(ev_open[0], exec_note="📝 測試限價單")
-        self.assertIn("🟢 新開倉", html_msg)
+        self.assertIn("買入開多", html_msg)
         self.assertIn("BTCUSDT", html_msg)
         self.assertIn("92,000.00", html_msg)
         self.assertIn("📝 測試限價單", html_msg)
@@ -135,53 +135,86 @@ class TestBinanceCopyBotSuite(unittest.IsolatedAsyncioTestCase):
     async def test_tracker_lead_data_positions_and_realtime_event(self) -> None:
         pid = "5075281354358777856"
         call_count = 0
+        now_ms = int(time.time() * 1000)
 
         def handler(request: httpx.Request) -> httpx.Response:
             nonlocal call_count
             url_str = str(request.url)
-            if "lead-data/positions" in url_str:
+            if "trade-history" in url_str:
                 call_count += 1
                 if call_count == 1:
-                    return httpx.Response(200, json={"code": "000000", "data": {"positions": []}})
+                    return httpx.Response(
+                        200,
+                        json={
+                            "code": "000000",
+                            "data": {
+                                "rows": [
+                                    {
+                                        "orderId": "1001",
+                                        "symbol": "BTCUSDT",
+                                        "side": "BUY",
+                                        "positionSide": "LONG",
+                                        "type": "LIMIT",
+                                        "avgPrice": "94000.0",
+                                        "executedQty": "0.2",
+                                        "totalPnl": "0",
+                                        "time": now_ms - 60000,
+                                    }
+                                ]
+                            },
+                        },
+                    )
                 return httpx.Response(
                     200,
                     json={
                         "code": "000000",
                         "data": {
-                            "positions": [
+                            "rows": [
                                 {
+                                    "orderId": "1001",
+                                    "symbol": "BTCUSDT",
+                                    "side": "BUY",
+                                    "positionSide": "LONG",
+                                    "type": "LIMIT",
+                                    "avgPrice": "94000.0",
+                                    "executedQty": "0.2",
+                                    "totalPnl": "0",
+                                    "time": now_ms - 60000,
+                                },
+                                {
+                                    "orderId": "1002",
                                     "symbol": "ETHUSDT",
+                                    "side": "SELL",
                                     "positionSide": "SHORT",
-                                    "amount": "-2.5",
-                                    "entryPrice": "3120.5",
-                                    "markPrice": "3115.0",
-                                    "pnl": "13.75",
-                                    "leverage": 15,
-                                }
+                                    "type": "LIMIT",
+                                    "avgPrice": "3120.5",
+                                    "executedQty": "2.5",
+                                    "totalPnl": "0",
+                                    "time": now_ms,
+                                },
                             ]
                         },
                     },
                 )
-            if "order-history" in url_str or "position-history" in url_str:
-                return httpx.Response(200, json={"code": "000000", "data": {"list": []}})
             return httpx.Response(404)
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as mock_client:
             tracker = BinanceCopyTracker(client=mock_client)
-            was_base, ev1, pos1 = await tracker.poll_portfolio(pid, "MasterETH")
+            was_base, ev1, fills1 = await tracker.poll_portfolio(pid, "MasterETH")
             self.assertTrue(was_base)
             self.assertEqual(ev1, [])
-            self.assertEqual(pos1, [])
+            self.assertIsNotNone(fills1)
+            self.assertEqual(len(fills1 or []), 1)
 
-            was_base2, ev2, pos2 = await tracker.poll_portfolio(pid, "MasterETH")
+            was_base2, ev2, fills2 = await tracker.poll_portfolio(pid, "MasterETH")
             self.assertFalse(was_base2)
             self.assertEqual(len(ev2), 1)
             self.assertEqual(ev2[0].symbol, "ETHUSDT")
             self.assertEqual(ev2[0].position_side, "SHORT")
             self.assertEqual(ev2[0].action, "OPEN")
-            self.assertEqual(ev2[0].curr_qty, 2.5)
-            self.assertEqual(ev2[0].unrealized_pnl, 13.75)
-            self.assertIsNotNone(pos2)
+            self.assertEqual(ev2[0].delta_qty, 2.5)
+            self.assertEqual(ev2[0].ref_price, 3120.5)
+            self.assertEqual(len(fills2 or []), 2)
 
     async def test_executor_ed25519_persistence_and_early_close_cancel(self) -> None:
         _, pem_str, env_priv = generate_ed25519_keypair()
