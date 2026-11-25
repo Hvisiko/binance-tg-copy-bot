@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: binance-tg-copy-bot
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m src.main
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ENABLE_AUTO_TRADE
+        value: "false"
+      - key: POLL_INTERVAL_SEC
+        value: "6"
+      - key: TRADE_MARGIN_USDT
+        value: "20"
+      - key: MAX_MARGIN_USDT
+        value: "60"
+      - key: TRADE_LEVERAGE
+        value: "10"
+      - key: LIMIT_ORDER_MODE
+        value: TARGET_PRICE
+      - key: LIMIT_SLIPPAGE_PCT
+        value: "0.08"
+      - key: LIMIT_ORDER_TIMEOUT_SEC
+        value: "180"
+      - key: EXIT_ORDER_TYPE
+        value: MARKET
