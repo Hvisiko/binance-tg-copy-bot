@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from .config import extract_portfolio_id
+
 logger = logging.getLogger(__name__)
 
 BINANCE_WEB_BASE = "https://www.binance.com"
@@ -380,6 +382,33 @@ class BinanceCopyTracker:
             uid = portfolio_id.split(":", 1)[1]
             return f"{BINANCE_WEB_BASE}/zh-TC/futures-activity/leaderboard/user/um?encryptedUid={uid}"
         return f"{BINANCE_WEB_BASE}/zh-TC/copy-trading/lead-details/{portfolio_id}"
+
+    async def resolve_portfolio_id(self, raw: str) -> Optional[str]:
+        """
+        Extract portfolioId directly, OR resolve Binance App share short-links
+        (e.g. https://app.binance.com/zh-TW/qr/dplk... or safu.im/...).
+        """
+        direct = extract_portfolio_id(raw)
+        if direct:
+            return direct
+
+        text = raw.strip()
+        if not text.startswith(("http://", "https://")):
+            return None
+        if not any(host in text.lower() for host in ("binance.com", "binance.me", "safu.im")):
+            return None
+
+        try:
+            resp = await self.client.get(text, follow_redirects=True)
+            pid = extract_portfolio_id(str(resp.url))
+            if pid:
+                return pid
+            pid_body = extract_portfolio_id(resp.text[:50000])
+            if pid_body:
+                return pid_body
+        except Exception as exc:
+            logger.debug("解析幣安短網址失敗 (%s): %s", text, exc)
+        return None
 
     async def fetch_top_portfolios(self, limit: int = 5) -> List[TraderProfile]:
         """Fetch top-performing public Copy-Trading lead traders (30D ROI)."""
@@ -776,6 +805,14 @@ class BinanceCopyTracker:
                 pass
         return None
 
+    def seed_watermarks(self, persisted_watermarks: Dict[str, int]) -> None:
+        """Seed persisted last_order_time_ms so trades occurring during a brief container nap are still caught!"""
+        for pid, ts in persisted_watermarks.items():
+            if ts > 0:
+                self._initialized[pid] = True
+                self._last_order_time_ms[pid] = int(ts)
+                self._seen_order_ids.setdefault(pid, set())
+
     def remove_portfolio_state(self, portfolio_id: str) -> None:
         self._initialized.pop(portfolio_id, None)
         self._seen_order_ids.pop(portfolio_id, None)
@@ -826,14 +863,17 @@ class BinanceCopyTracker:
             return (False, [], None)
 
         new_raw: List[TraderOrderFill] = []
-        # Allow 5-minute clock-skew / delayed settlement window, deduplicated strictly by seen_ids
-        baseline_cutoff = self._last_order_time_ms.get(portfolio_id, 0) - 300_000
+        saved_wm = self._last_order_time_ms.get(portfolio_id, 0)
+        # If seen_ids is empty right after a container restart with a persisted watermark,
+        # strictly require order_time_ms > saved_wm so historical fills don't re-fire!
+        cutoff = (saved_wm + 1) if not seen_ids else (saved_wm - 300_000)
         for f in raw_fills:
-            if f.order_id not in seen_ids and f.order_time_ms >= baseline_cutoff:
+            if f.order_id not in seen_ids:
                 seen_ids.add(f.order_id)
-                if f.order_time_ms > self._last_order_time_ms.get(portfolio_id, 0):
-                    self._last_order_time_ms[portfolio_id] = f.order_time_ms
-                new_raw.append(f)
+                if f.order_time_ms >= cutoff:
+                    if f.order_time_ms > self._last_order_time_ms.get(portfolio_id, 0):
+                        self._last_order_time_ms[portfolio_id] = f.order_time_ms
+                    new_raw.append(f)
 
         events = [
             fill_to_event(portfolio_id, trader_name, mf)

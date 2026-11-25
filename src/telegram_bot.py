@@ -397,11 +397,14 @@ class TelegramBotController:
         if not text or not chat_id:
             return
 
-        # Allow pasting a Binance copy-trading URL directly without typing `/add`!
+        # Allow pasting a Binance copy-trading URL (or App QR short-link) directly without typing `/add`!
         if not text.startswith("/"):
-            direct_pid = extract_portfolio_id(text) if "binance.com" in text.lower() else None
-            if direct_pid and self._authorize_actor(chat_id, from_user_id):
-                await self._cmd_add(chat_id, direct_pid)
+            if any(h in text.lower() for h in ("binance.com", "binance.me", "safu.im")) and self._authorize_actor(
+                chat_id, from_user_id
+            ):
+                resolved_pid = await self.tracker.resolve_portfolio_id(text)
+                if resolved_pid:
+                    await self._cmd_add(chat_id, resolved_pid)
             return
 
         parts = text.split(maxsplit=1)
@@ -504,10 +507,10 @@ class TelegramBotController:
         await self.send_message("\n".join(lines), chat_id=chat_id, reply_markup=markup)
 
     async def _cmd_add(self, chat_id: str, arg: str) -> None:
-        pid = extract_portfolio_id(arg)
+        pid = await self.tracker.resolve_portfolio_id(arg)
         if not pid:
             await self.send_message(
-                "❓ 請提供幣安帶單員網址或數字 ID，例如：\n"
+                "❓ 請提供幣安帶單員網址（支援電腦網頁或手機 App 分享短網址）或數字 ID，例如：\n"
                 "<code>/add https://www.binance.com/zh-TC/copy-trading/lead-details/5075281354358777856</code>\n"
                 "或點擊 <code>/top</code> 一鍵按鈕直接加入。",
                 chat_id=chat_id,
@@ -515,9 +518,12 @@ class TelegramBotController:
             return
         profile = await self.tracker.fetch_trader_detail(pid)
         self.cfg.tracked_portfolios[pid] = profile.nickname
-        self.cfg.save_state()
         self.tracker.remove_portfolio_state(pid)
         _, _, init_fills = await self.tracker.poll_portfolio(pid, profile.nickname)
+        wm = self.tracker._last_order_time_ms.get(pid, 0)
+        if wm > 0:
+            self.cfg.last_order_time_ms[pid] = wm
+        self.cfg.save_state()
         snap = format_recent_trades_html(profile, init_fills, max_items=5)
         markup = {
             "inline_keyboard": [
@@ -538,6 +544,7 @@ class TelegramBotController:
         pid = extract_portfolio_id(arg) or arg.strip()
         if pid in self.cfg.tracked_portfolios:
             removed_name = self.cfg.tracked_portfolios.pop(pid)
+            self.cfg.last_order_time_ms.pop(pid, None)
             self.cfg.save_state()
             self.tracker.remove_portfolio_state(pid)
             await self.send_message(

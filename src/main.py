@@ -123,12 +123,18 @@ async def trader_monitor_loop(
     bot: TelegramBotController,
     stop_event: asyncio.Event,
 ) -> None:
+    # Seed persisted trade watermarks so container wakeups never miss trades or re-fire old ones
+    tracker.seed_watermarks(cfg.last_order_time_ms)
+
     # Hydrate trader nicknames on startup
+    hydrated_any = False
     for pid in cfg.list_portfolio_ids():
         if cfg.tracked_portfolios.get(pid) == pid:
             prof = await tracker.fetch_trader_detail(pid)
             cfg.tracked_portfolios[pid] = prof.nickname
-            cfg.save_state()
+            hydrated_any = True
+    if hydrated_any:
+        cfg.save_state()
 
     notify_startup = os.getenv("NOTIFY_ON_STARTUP", "false").lower() in ("1", "true", "yes", "on")
     if notify_startup and cfg.telegram_bot_token and cfg.telegram_chat_id:
@@ -150,6 +156,10 @@ async def trader_monitor_loop(
                 break
             try:
                 was_baseline, events, _ = await tracker.poll_portfolio(pid, name)
+                new_wm = tracker._last_order_time_ms.get(pid, 0)
+                if new_wm > cfg.last_order_time_ms.get(pid, 0):
+                    cfg.last_order_time_ms[pid] = new_wm
+                    cfg.save_state()
                 if was_baseline and events:
                     continue
                 for ev in events:
