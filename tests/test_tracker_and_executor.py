@@ -18,6 +18,7 @@ from src.binance_tracker import (
     BinanceCopyTracker,
     TraderOrderFill,
     TraderPosition,
+    aggregate_burst_fills,
     diff_positions,
 )
 from src.config import AppConfig, extract_portfolio_id
@@ -71,6 +72,20 @@ class TestBinanceCopyBotSuite(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(chunks), 3)
         for ch in chunks:
             self.assertLessEqual(len(ch), 1000)
+
+    def test_aggregate_burst_partial_fills(self) -> None:
+        raw = [
+            TraderOrderFill("1", "NVDAUSDT", "BUY", "LONG", "LIMIT", 144.3, 90.27, 0.0, 10000),
+            TraderOrderFill("2", "NVDAUSDT", "BUY", "LONG", "LIMIT", 144.3, 27.72, 0.0, 10100),
+            TraderOrderFill("3", "NVDAUSDT", "BUY", "LONG", "LIMIT", 144.3, 509.36, 0.0, 10200),
+            TraderOrderFill("4", "NVDAUSDT", "BUY", "LONG", "LIMIT", 144.3, 0.04, 0.0, 10250),
+            TraderOrderFill("5", "BTCUSDT", "SELL", "LONG", "MARKET", 95000.0, 0.5, 320.0, 25000),
+        ]
+        merged = aggregate_burst_fills(raw)
+        self.assertEqual(len(merged), 2)
+        self.assertAlmostEqual(merged[0].executed_qty, 627.39)
+        self.assertAlmostEqual(merged[0].avg_price, 144.3)
+        self.assertEqual(merged[1].symbol, "BTCUSDT")
 
     def test_diff_positions_lifecycle_and_telegram_format(self) -> None:
         pid = "4776391476896986880"
