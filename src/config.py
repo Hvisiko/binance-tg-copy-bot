@@ -45,6 +45,8 @@ def extract_portfolio_id(raw: str) -> Optional[str]:
 class AppConfig:
     telegram_bot_token: str
     telegram_chat_id: str
+    admin_user_id: str = ""
+    webhook_base_url: str = ""
     poll_interval_sec: float = 6.0
     binance_web_cookie: str = ""
 
@@ -87,9 +89,16 @@ class AppConfig:
             else max(trade_margin * 3.0, 50.0)
         )
 
+        webhook_url = (
+            os.getenv("WEBHOOK_BASE_URL", "").strip()
+            or os.getenv("RENDER_EXTERNAL_URL", "").strip()
+        ).rstrip("/")
+
         cfg = cls(
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            admin_user_id=os.getenv("TELEGRAM_ADMIN_USER_ID", "").strip(),
+            webhook_base_url=webhook_url,
             poll_interval_sec=max(3.0, float(os.getenv("POLL_INTERVAL_SEC", "6"))),
             binance_web_cookie=os.getenv("BINANCE_WEB_COOKIE", "").strip(),
             enable_auto_trade=os.getenv("ENABLE_AUTO_TRADE", "false").lower()
@@ -122,6 +131,8 @@ class AppConfig:
 
             if not self.telegram_chat_id and data.get("telegram_chat_id"):
                 self.telegram_chat_id = str(data["telegram_chat_id"]).strip()
+            if not self.admin_user_id and data.get("admin_user_id"):
+                self.admin_user_id = str(data["admin_user_id"]).strip()
 
             saved_portfolios = data.get("tracked_portfolios", {})
             if isinstance(saved_portfolios, dict):
@@ -159,6 +170,7 @@ class AppConfig:
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "telegram_chat_id": self.telegram_chat_id,
+                "admin_user_id": self.admin_user_id,
                 "tracked_portfolios": self.tracked_portfolios,
                 "enable_auto_trade": self.enable_auto_trade,
                 "trade_margin_usdt": self.trade_margin_usdt,

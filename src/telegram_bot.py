@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import html
 import logging
 from datetime import datetime, timedelta, timezone
@@ -157,6 +158,34 @@ class TelegramBotController:
     def api_base(self) -> str:
         return f"https://api.telegram.org/bot{self.cfg.telegram_bot_token}"
 
+    @property
+    def webhook_path(self) -> str:
+        secret = hashlib.sha256(self.cfg.telegram_bot_token.encode("utf-8")).hexdigest()[:24]
+        return f"/tg-webhook/{secret}"
+
+    async def setup_webhook(self, base_url: str) -> bool:
+        if not self.cfg.telegram_bot_token or not base_url:
+            return False
+        full_url = f"{base_url.rstrip('/')}{self.webhook_path}"
+        try:
+            resp = await self.client.post(
+                f"{self.api_base}/setWebhook",
+                json={
+                    "url": full_url,
+                    "allowed_updates": ["message", "edited_message", "callback_query"],
+                    "drop_pending_updates": True,
+                },
+            )
+            ok = resp.status_code == 200 and bool((resp.json() or {}).get("ok"))
+            if ok:
+                logger.info("已啟用 Telegram Webhook 即時推播喚醒模式: %s/tg-webhook/***", base_url.rstrip("/"))
+            else:
+                logger.error("設定 Telegram Webhook 失敗 (%s): %s", resp.status_code, resp.text)
+            return ok
+        except Exception as exc:
+            logger.error("設定 Telegram Webhook 異常: %s", exc)
+            return False
+
     async def close(self) -> None:
         if self._owns_client:
             await self.client.aclose()
@@ -226,17 +255,18 @@ class TelegramBotController:
         except Exception:
             pass
 
-    async def register_commands(self) -> None:
+    async def register_commands(self, use_webhook: bool = False) -> None:
         if not self.cfg.telegram_bot_token:
             return
-        # Ensure no stale Webhook blocks getUpdates long-polling (prevents 409 Conflict)
-        try:
-            await self.client.post(
-                f"{self.api_base}/deleteWebhook",
-                json={"drop_pending_updates": False},
-            )
-        except Exception:
-            pass
+        if not use_webhook:
+            # Ensure no stale Webhook blocks getUpdates long-polling (prevents 409 Conflict)
+            try:
+                await self.client.post(
+                    f"{self.api_base}/deleteWebhook",
+                    json={"drop_pending_updates": False},
+                )
+            except Exception:
+                pass
         commands = [
             {"command": "start", "description": "開啟互動控制面板與系統狀態"},
             {"command": "top", "description": "查詢幣安 30 日高收益帶單員（附一鍵追蹤按鈕）"},
@@ -271,34 +301,60 @@ class TelegramBotController:
             data = resp.json()
             for upd in data.get("result", []):
                 self._update_offset = int(upd["update_id"]) + 1
-                if "callback_query" in upd:
-                    await self._handle_callback_query(upd["callback_query"])
-                    continue
-                msg = upd.get("message") or upd.get("edited_message")
-                if msg:
-                    await self._handle_incoming_message(msg)
+                await self.process_update(upd)
         except Exception as exc:
             logger.debug("Telegram getUpdates 輪詢略過: %s", exc)
 
-    def _authorize_chat(self, chat_id: str) -> bool:
+    async def process_update(self, upd: Dict[str, Any]) -> None:
+        if "callback_query" in upd:
+            await self._handle_callback_query(upd["callback_query"])
+            return
+        msg = upd.get("message") or upd.get("edited_message")
+        if msg:
+            await self._handle_incoming_message(msg)
+
+    def _authorize_actor(
+        self, chat_id: str, user_id: str = "", bind_push_chat: bool = False
+    ) -> bool:
         if not chat_id:
             return False
-        if not self.cfg.telegram_chat_id:
+        # First-ever interaction: bind both admin_user_id and default push telegram_chat_id
+        if not self.cfg.telegram_chat_id and not self.cfg.admin_user_id:
             self.cfg.telegram_chat_id = chat_id
+            if user_id:
+                self.cfg.admin_user_id = user_id
             self.cfg.save_state()
-            logger.info("已自動綁定並儲存管理員 TELEGRAM_CHAT_ID=%s", chat_id)
+            logger.info(
+                "已自動綁定管理員 user_id=%s 及預設推播 chat_id=%s", user_id, chat_id
+            )
             return True
-        return chat_id == str(self.cfg.telegram_chat_id)
+
+        # Owner recognized by personal user_id across both private DM and group chats
+        if user_id and self.cfg.admin_user_id and user_id == str(self.cfg.admin_user_id):
+            if bind_push_chat and self.cfg.telegram_chat_id != chat_id:
+                self.cfg.telegram_chat_id = chat_id
+                self.cfg.save_state()
+                logger.info("已切換預設推播聊天室為 chat_id=%s", chat_id)
+            return True
+
+        if self.cfg.telegram_chat_id and chat_id == str(self.cfg.telegram_chat_id):
+            if user_id and not self.cfg.admin_user_id:
+                self.cfg.admin_user_id = user_id
+                self.cfg.save_state()
+            return True
+
+        return False
 
     async def _handle_callback_query(self, cq: Dict[str, Any]) -> None:
         cq_id = str(cq.get("id") or "")
         data = str(cq.get("data") or "")
+        from_user_id = str((cq.get("from") or {}).get("id") or "")
         msg = cq.get("message") or {}
         chat_Obj = msg.get("chat") or {}
         chat_id = str(chat_Obj.get("id") or "")
         chat_type = str(chat_Obj.get("type") or "private")
 
-        if not self._authorize_chat(chat_id):
+        if not self._authorize_actor(chat_id, from_user_id):
             await self._answer_callback(cq_id, "⛔ 未授權的操作")
             return
 
@@ -331,6 +387,7 @@ class TelegramBotController:
         chat_obj = msg.get("chat") or {}
         chat_id = str(chat_obj.get("id") or "")
         chat_type = str(chat_obj.get("type") or "private")
+        from_user_id = str((msg.get("from") or {}).get("id") or "")
         text = str(msg.get("text") or "").strip()
         if not text or not chat_id:
             return
@@ -338,17 +395,18 @@ class TelegramBotController:
         # Allow pasting a Binance copy-trading URL directly without typing `/add`!
         if not text.startswith("/"):
             direct_pid = extract_portfolio_id(text) if "binance.com" in text.lower() else None
-            if direct_pid and self._authorize_chat(chat_id):
+            if direct_pid and self._authorize_actor(chat_id, from_user_id):
                 await self._cmd_add(chat_id, direct_pid)
-            return
-
-        if not self._authorize_chat(chat_id):
-            await self.send_message("⛔ 未授權的 Chat ID，僅限管理員操作。", chat_id=chat_id)
             return
 
         parts = text.split(maxsplit=1)
         cmd = parts[0].split("@")[0].lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
+
+        is_bind_cmd = cmd == "/start"
+        if not self._authorize_actor(chat_id, from_user_id, bind_push_chat=is_bind_cmd):
+            await self.send_message("⛔ 未授權的帳號或群組，僅限管理員操作。", chat_id=chat_id)
+            return
 
         if cmd in ("/start", "/help", "/status"):
             await self._cmd_start(chat_id, chat_type)
