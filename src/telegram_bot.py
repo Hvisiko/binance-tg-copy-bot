@@ -571,7 +571,7 @@ class TelegramBotController:
                 nickname=name,
                 url=BinanceCopyTracker.build_trader_url(pid),
             )
-            fills = await self.tracker.fetch_recent_orders(pid, limit=10)
+            fills = await self.tracker.fetch_recent_orders(pid, limit=50, merge_bursts=True)
             blocks.append(format_recent_trades_html(prof, fills, max_items=5))
             kb_rows.append(
                 [{"text": f"🗑️ 停止追蹤 {name[:14]}", "callback_data": f"cb_rm:{pid}"}]

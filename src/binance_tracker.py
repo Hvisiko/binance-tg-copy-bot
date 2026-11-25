@@ -122,6 +122,59 @@ def _safe_int(val: Any, default: int = 0) -> int:
         return default
 
 
+def aggregate_burst_fills(
+    fills: List[TraderOrderFill], window_ms: int = 5000
+) -> List[TraderOrderFill]:
+    """
+    Merge matching-engine partial fills of the same order/burst (same symbol, side, position_side
+    within `window_ms`) into a single consolidated trade with volume-weighted average price.
+    Prevents 1 large order split into 10 micro-fills from spamming 10 Telegram alerts or 10 copy orders!
+    """
+    if not fills:
+        return []
+
+    sorted_fills = sorted(fills, key=lambda x: x.order_time_ms)
+    merged: List[TraderOrderFill] = []
+
+    for f in sorted_fills:
+        if merged:
+            prev = merged[-1]
+            same_dir = (
+                prev.symbol == f.symbol
+                and prev.side == f.side
+                and prev.position_side == f.position_side
+            )
+            within_window = abs(f.order_time_ms - prev.order_time_ms) <= window_ms
+            if same_dir and within_window:
+                total_qty = prev.executed_qty + f.executed_qty
+                vwap = (
+                    (prev.avg_price * prev.executed_qty + f.avg_price * f.executed_qty)
+                    / total_qty
+                    if total_qty > 0
+                    else f.avg_price
+                )
+                prev.avg_price = vwap
+                prev.executed_qty = total_qty
+                prev.realized_pnl += f.realized_pnl
+                prev.order_time_ms = max(prev.order_time_ms, f.order_time_ms)
+                continue
+
+        merged.append(
+            TraderOrderFill(
+                order_id=f.order_id,
+                symbol=f.symbol,
+                side=f.side,
+                position_side=f.position_side,
+                order_type=f.order_type,
+                avg_price=f.avg_price,
+                executed_qty=f.executed_qty,
+                realized_pnl=f.realized_pnl,
+                order_time_ms=f.order_time_ms,
+            )
+        )
+    return merged
+
+
 def fill_to_event(
     portfolio_id: str, trader_name: str, fill: TraderOrderFill, default_leverage: int = 10
 ) -> PositionEvent:
@@ -544,7 +597,7 @@ class BinanceCopyTracker:
         return fills
 
     async def fetch_recent_orders(
-        self, portfolio_id: str, limit: int = 20
+        self, portfolio_id: str, limit: int = 50, merge_bursts: bool = False
     ) -> Optional[List[TraderOrderFill]]:
         """
         Fetch latest executed trade / order history records for a Copy-Trading portfolio.
@@ -601,7 +654,7 @@ class BinanceCopyTracker:
                     fills = self._parse_fill_rows(rows)
                     if fills:
                         fills.sort(key=lambda x: x.order_time_ms)
-                        return fills
+                        return aggregate_burst_fills(fills) if merge_bursts else fills
                     saw_valid_empty = True
                     break
                 except Exception as exc:
@@ -677,7 +730,7 @@ class BinanceCopyTracker:
                         )
                 if fills:
                     fills.sort(key=lambda x: x.order_time_ms)
-                    return fills
+                    return aggregate_burst_fills(fills) if merge_bursts else fills
                 saw_valid_empty = True
             except Exception as exc:
                 logger.debug("position-history fallback error (%s): %s", url, exc)
@@ -754,37 +807,42 @@ class BinanceCopyTracker:
             self._positions_cache[portfolio_id] = curr_map
             return (False, evs, [])
 
-        fills = await self.fetch_recent_orders(portfolio_id, limit=20)
+        raw_fills = await self.fetch_recent_orders(portfolio_id, limit=50, merge_bursts=False)
         is_first = not self._initialized.get(portfolio_id, False)
         seen_ids = self._seen_order_ids.setdefault(portfolio_id, set())
 
         if is_first:
-            if fills is None:
+            if raw_fills is None:
                 return (True, [], None)
             self._initialized[portfolio_id] = True
             baseline_ts = int(time.time() * 1000)
-            for f in fills:
+            for f in raw_fills:
                 seen_ids.add(f.order_id)
                 baseline_ts = max(baseline_ts, f.order_time_ms)
             self._last_order_time_ms[portfolio_id] = baseline_ts
-            return (True, [], fills)
+            return (True, [], aggregate_burst_fills(raw_fills))
 
-        if fills is None:
+        if raw_fills is None:
             return (False, [], None)
 
-        events: List[PositionEvent] = []
+        new_raw: List[TraderOrderFill] = []
         # Allow 5-minute clock-skew / delayed settlement window, deduplicated strictly by seen_ids
         baseline_cutoff = self._last_order_time_ms.get(portfolio_id, 0) - 300_000
-        for f in fills:
+        for f in raw_fills:
             if f.order_id not in seen_ids and f.order_time_ms >= baseline_cutoff:
                 seen_ids.add(f.order_id)
                 if f.order_time_ms > self._last_order_time_ms.get(portfolio_id, 0):
                     self._last_order_time_ms[portfolio_id] = f.order_time_ms
-                events.append(fill_to_event(portfolio_id, trader_name, f))
+                new_raw.append(f)
 
-        if len(seen_ids) > 600:
+        events = [
+            fill_to_event(portfolio_id, trader_name, mf)
+            for mf in aggregate_burst_fills(new_raw)
+        ]
+
+        if len(seen_ids) > 1000:
             # Retain recent order IDs so memory never grows unbounded
-            recent_keep = {f.order_id for f in fills}
+            recent_keep = {f.order_id for f in raw_fills}
             self._seen_order_ids[portfolio_id] = recent_keep
 
-        return (False, events, fills)
+        return (False, events, aggregate_burst_fills(raw_fills))
