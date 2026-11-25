@@ -229,6 +229,14 @@ class TelegramBotController:
     async def register_commands(self) -> None:
         if not self.cfg.telegram_bot_token:
             return
+        # Ensure no stale Webhook blocks getUpdates long-polling (prevents 409 Conflict)
+        try:
+            await self.client.post(
+                f"{self.api_base}/deleteWebhook",
+                json={"drop_pending_updates": False},
+            )
+        except Exception:
+            pass
         commands = [
             {"command": "start", "description": "開啟互動控制面板與系統狀態"},
             {"command": "top", "description": "查詢幣安 30 日高收益帶單員（附一鍵追蹤按鈕）"},
@@ -254,7 +262,8 @@ class TelegramBotController:
                 params={"offset": self._update_offset, "timeout": 20},
             )
             if resp.status_code == 409:
-                # Rolling deployment overlap protection
+                # Rolling deployment overlap or duplicate bot instance polling same token
+                logger.warning("Telegram getUpdates 409 衝突 (請確認無其他重複運行實例): %s", resp.text)
                 await asyncio.sleep(5.0)
                 return
             if resp.status_code != 200:
