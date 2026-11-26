@@ -179,7 +179,7 @@ class TelegramBotController:
                 json={
                     "url": full_url,
                     "allowed_updates": ["message", "edited_message", "callback_query"],
-                    "drop_pending_updates": True,
+                    "drop_pending_updates": False,
                 },
             )
             ok = resp.status_code == 200 and bool((resp.json() or {}).get("ok"))
