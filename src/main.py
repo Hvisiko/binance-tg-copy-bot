@@ -168,7 +168,7 @@ async def trader_monitor_loop(
                     await bot.send_message(msg_html)
             except Exception as exc:
                 logger.warning("監控交易員 %s (%s) 時發生異常: %s", name, pid, exc)
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.8)
 
         # Check pending limit orders for fills or timeout auto-cancellation
         try:

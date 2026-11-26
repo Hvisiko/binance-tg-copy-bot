@@ -44,7 +44,7 @@ def _fmt_pct(pct: float) -> str:
     if ap >= 0.01:
         return f"{pct:.2f}%"
     if ap > 0:
-        return "<0.01%" if pct > 0 else ">-0.01%"
+        return "&lt;0.01%" if pct > 0 else "-&lt;0.01%"
     return "0%"
 
 
@@ -651,9 +651,11 @@ class TelegramBotController:
         blocks: List[str] = []
         for idx, (pid, name) in enumerate(items):
             if idx > 0:
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(0.45)
             prof = await self.tracker.get_cached_profile(pid, fallback_name=name)
-            fills = await self.tracker.fetch_recent_orders(pid, limit=10, merge_bursts=False)
+            fills = await self.tracker.fetch_recent_orders(
+                pid, limit=10, merge_bursts=False, use_recent_cache_sec=5.0
+            )
             blocks.append(format_recent_trades_html(prof, fills, max_items=5))
         header = "📜 <b>最新交易紀錄</b> <i>(倉位佔交易員總本金%)</i>\n━━━━━━━━━━━━━━\n"
         sep = "\n──────────────\n"

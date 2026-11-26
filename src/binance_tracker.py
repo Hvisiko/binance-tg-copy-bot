@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
@@ -384,6 +385,7 @@ class BinanceCopyTracker:
         self._last_order_time_ms: Dict[str, int] = {}
         self._positions_cache: Dict[str, Dict[Tuple[str, str], TraderPosition]] = {}
         self._profile_cache: Dict[str, Tuple[float, TraderProfile]] = {}
+        self._orders_cache: Dict[str, Tuple[float, List[TraderOrderFill]]] = {}
 
     async def close(self) -> None:
         if self._owns_client:
@@ -670,16 +672,25 @@ class BinanceCopyTracker:
         return fills
 
     async def fetch_recent_orders(
-        self, portfolio_id: str, limit: int = 20, merge_bursts: bool = False
+        self,
+        portfolio_id: str,
+        limit: int = 20,
+        merge_bursts: bool = False,
+        use_recent_cache_sec: float = 0.0,
     ) -> Optional[List[TraderOrderFill]]:
         """
         Fetch latest executed order history records (exact match to Binance Copy-Trading `最新紀錄` tab).
-        Primary: `lead-portfolio/order-history` (7-day window / pageSize <= 20 — each row is 1 complete order
+        Primary: `lead-portfolio/order-history` (7-day window / pageSize 10 — each row is 1 complete order
         with full `executedQty`, `avgPrice`, `type`, and `totalPnl`).
         Fallback: `trade-history` (with sub-fill aggregation) -> `position-history`.
         """
         if portfolio_id.startswith("uid:"):
             return None
+
+        if use_recent_cache_sec > 0:
+            cached_ord = self._orders_cache.get(portfolio_id)
+            if cached_ord and (time.time() - cached_ord[0]) <= use_recent_cache_sec:
+                return aggregate_burst_fills(cached_ord[1]) if merge_bursts else list(cached_ord[1])
 
         now_ms = int(time.time() * 1000)
         # Exact 101-byte payload used by Binance Web UI `最新紀錄` tab (`pageSize: 10`, 7D window, no pageNumber)
@@ -701,16 +712,12 @@ class BinanceCopyTracker:
             },
         ]
 
-        order_history_urls = [
-            f"{COPY_TRADE_FRIENDLY}/lead-portfolio/order-history",
-            f"{COPY_TRADE_PUBLIC}/lead-portfolio/order-history",
-        ]
-
+        url = f"{COPY_TRADE_FRIENDLY}/lead-portfolio/order-history"
         saw_valid_empty = False
 
-        # 1. Primary: `order-history` (100% 1-to-1 match with Binance `最新紀錄` UI!)
-        for url in order_history_urls:
-            for req_body in order_history_payloads:
+        # 1. Primary: `order-history` with automatic retry on 11012005 rate-limit busy
+        for req_body in order_history_payloads:
+            for attempt in range(2):
                 try:
                     resp = await self.client.post(
                         url,
@@ -718,27 +725,30 @@ class BinanceCopyTracker:
                         headers={"Referer": f"{BINANCE_WEB_BASE}/zh-TC/copy-trading/lead-details/{portfolio_id}"},
                     )
                     if resp.status_code != 200:
-                        logger.info("order-history status=%s on %s: %s", resp.status_code, url, resp.text[:200])
-                        continue
+                        break
                     body = resp.json()
-                    if body.get("success") is False or (
-                        body.get("code") and str(body.get("code")) != "000000"
-                    ):
-                        logger.info("order-history code=%s msg=%s", body.get("code"), body.get("message"))
+                    code_str = str(body.get("code") or "")
+                    if code_str == "11012005" and attempt == 0:
+                        await asyncio.sleep(0.9)
                         continue
+                    if body.get("success") is False or (code_str and code_str != "000000"):
+                        break
                     rows = self._extract_list_rows(body.get("data"))
                     if rows is None:
-                        continue
+                        break
                     if not rows:
                         saw_valid_empty = True
-                        continue
+                        break
                     fills = self._parse_fill_rows(rows)
                     if fills:
                         fills.sort(key=lambda x: x.order_time_ms)
+                        self._orders_cache[portfolio_id] = (time.time(), fills)
                         return aggregate_burst_fills(fills) if merge_bursts else fills
                     saw_valid_empty = True
+                    break
                 except Exception as exc:
                     logger.debug("order-history fetch error (%s): %s", url, exc)
+                    break
 
         # 2. Secondary fallback: `trade-history` (always aggregate matching-engine sub-fills)
         trade_history_urls = [
