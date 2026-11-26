@@ -77,13 +77,14 @@ def format_position_event_html(event: PositionEvent, exec_note: str = "") -> str
     url = BinanceCopyTracker.build_trader_url(event.portfolio_id)
     safe_name = html.escape(event.trader_name)
 
+    notional_val = event.ref_price * event.delta_qty
     lines = [
         f"⚡ <b>最新成交快訊</b> ｜ <b>{html.escape(event.symbol)}</b>",
         f"📌 動作：{dir_badge}",
         f"👤 交易員：<a href=\"{url}\">{safe_name}</a> (<code>{event.portfolio_id}</code>)",
         f"💰 成交均價：<code>{_fmt_num(event.ref_price)}</code> USDT",
-        f"📦 成交數量：<code>{_fmt_num(event.delta_qty)}</code>"
-        + (f" （類型：<code>{html.escape(event.order_type)}</code>）" if event.order_type else ""),
+        f"📦 成交數量：<code>{_fmt_num(event.delta_qty)}</code>（總價值 <code>{notional_val:,.2f} U</code>"
+        + (f"｜<code>{html.escape(event.order_type)}</code>）" if event.order_type else "）"),
     ]
 
     if event.realized_pnl is not None and abs(event.realized_pnl) > 1e-9:
@@ -136,9 +137,11 @@ def format_recent_trades_html(
             sign = "+" if f.realized_pnl >= 0 else ""
             pnl_part = f" ｜ 盈虧 <code>{sign}{f.realized_pnl:,.2f} U</code>"
 
+        notional_u = f.avg_price * f.executed_qty
+        qty_disp = f"{f.executed_qty:,.4f}".rstrip("0").rstrip(".") if f.executed_qty >= 1 else _fmt_num(f.executed_qty)
         lines.append(
-            f"• <code>{dt_str}</code> ｜ <b>{html.escape(f.symbol)}</b> {tag}\n"
-            f"  成交價 <code>{_fmt_num(f.avg_price)}</code> × 數量 <code>{_fmt_num(f.executed_qty)}</code>{pnl_part}"
+            f"• <code>{dt_str}</code> ｜ <b>{html.escape(f.symbol)}</b> {tag} (<code>{html.escape(f.order_type)}</code>)\n"
+            f"  均價 <code>{_fmt_num(f.avg_price)}</code> × 數量 <code>{qty_disp}</code>（價值 <code>{notional_u:,.2f} U</code>）{pnl_part}"
         )
     return "\n".join(lines)
 
@@ -578,7 +581,7 @@ class TelegramBotController:
                 nickname=name,
                 url=BinanceCopyTracker.build_trader_url(pid),
             )
-            fills = await self.tracker.fetch_recent_orders(pid, limit=50, merge_bursts=True)
+            fills = await self.tracker.fetch_recent_orders(pid, limit=20, merge_bursts=False)
             blocks.append(format_recent_trades_html(prof, fills, max_items=5))
             kb_rows.append(
                 [{"text": f"🗑️ 停止追蹤 {name[:14]}", "callback_data": f"cb_rm:{pid}"}]

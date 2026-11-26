@@ -606,7 +606,7 @@ class BinanceCopyTracker:
                 r.get("orderId")
                 or r.get("tradeId")
                 or r.get("id")
-                or f"{symbol}-{side}-{pos_side}-{ts}-{qty:g}-{avg_p:g}"
+                or f"{symbol}-{side}-{pos_side}-{ts}-{_safe_int(r.get('orderUpdateTime'), ts)}-{qty:.8f}-{avg_p:.8f}"
             )
             otype = str(r.get("type") or r.get("orderType") or "LIMIT").strip().upper()
 
@@ -626,36 +626,43 @@ class BinanceCopyTracker:
         return fills
 
     async def fetch_recent_orders(
-        self, portfolio_id: str, limit: int = 50, merge_bursts: bool = False
+        self, portfolio_id: str, limit: int = 20, merge_bursts: bool = False
     ) -> Optional[List[TraderOrderFill]]:
         """
-        Fetch latest executed trade / order history records for a Copy-Trading portfolio.
-        Returns:
-          - List[TraderOrderFill] sorted ascending by order_time_ms (oldest -> newest) when reachable
-          - None if all history endpoints were unreachable / unauthorized
+        Fetch latest executed order history records (exact match to Binance Copy-Trading `最新紀錄` tab).
+        Primary: `lead-portfolio/order-history` (7-day window / pageSize <= 20 — each row is 1 complete order
+        with full `executedQty`, `avgPrice`, `type`, and `totalPnl`).
+        Fallback: `trade-history` (with sub-fill aggregation) -> `position-history`.
         """
         if portfolio_id.startswith("uid:"):
             return None
 
         now_ms = int(time.time() * 1000)
+        start_7d_ms = now_ms - 7 * 86400 * 1000
         start_30d_ms = now_ms - 30 * 86400 * 1000
-        payload_with_time = {
-            "portfolioId": portfolio_id,
-            "startTime": start_30d_ms,
-            "endTime": now_ms,
-            "pageSize": limit,
-            "pageNumber": 1,
-        }
-        payload_paged = {
-            "portfolioId": portfolio_id,
-            "pageNumber": 1,
-            "pageSize": limit,
-        }
+        safe_page_size = max(5, min(20, limit))
 
-        trade_and_order_urls = [
-            f"{COPY_TRADE_FRIENDLY}/lead-portfolio/trade-history",
-            f"{COPY_TRADE_PUBLIC}/lead-portfolio/trade-history",
-            f"{COPY_TRADE_FRIENDLY}/lead-data/trade-history",
+        order_history_payloads = [
+            {
+                "portfolioId": portfolio_id,
+                "startTime": start_7d_ms,
+                "endTime": now_ms,
+                "pageSize": safe_page_size,
+            },
+            {
+                "portfolioId": portfolio_id,
+                "pageSize": 10,
+            },
+            {
+                "portfolioId": portfolio_id,
+                "startTime": start_30d_ms,
+                "endTime": now_ms,
+                "pageSize": 10,
+                "pageNumber": 1,
+            },
+        ]
+
+        order_history_urls = [
             f"{COPY_TRADE_FRIENDLY}/lead-portfolio/order-history",
             f"{COPY_TRADE_PUBLIC}/lead-portfolio/order-history",
             f"{COPY_TRADE_FRIENDLY}/lead-data/order-history",
@@ -663,8 +670,9 @@ class BinanceCopyTracker:
 
         saw_valid_empty = False
 
-        for url in trade_and_order_urls:
-            for req_body in (payload_with_time, payload_paged):
+        # 1. Primary: `order-history` (100% 1-to-1 match with Binance `最新紀錄` UI!)
+        for url in order_history_urls:
+            for req_body in order_history_payloads:
                 try:
                     resp = await self.client.post(url, json=req_body)
                     if resp.status_code != 200:
@@ -679,17 +687,58 @@ class BinanceCopyTracker:
                         continue
                     if not rows:
                         saw_valid_empty = True
-                        break
+                        continue
                     fills = self._parse_fill_rows(rows)
                     if fills:
                         fills.sort(key=lambda x: x.order_time_ms)
                         return aggregate_burst_fills(fills) if merge_bursts else fills
                     saw_valid_empty = True
-                    break
                 except Exception as exc:
-                    logger.debug("fetch_recent_orders error (%s): %s", url, exc)
+                    logger.debug("order-history fetch error (%s): %s", url, exc)
 
-        # Fallback: check position-history (emits opening + closing records from historical positions)
+        # 2. Secondary fallback: `trade-history` (always aggregate matching-engine sub-fills)
+        trade_history_urls = [
+            f"{COPY_TRADE_FRIENDLY}/lead-portfolio/trade-history",
+            f"{COPY_TRADE_PUBLIC}/lead-portfolio/trade-history",
+        ]
+        trade_payload = {
+            "portfolioId": portfolio_id,
+            "startTime": start_7d_ms,
+            "endTime": now_ms,
+            "pageSize": 50,
+            "pageNumber": 1,
+        }
+        for url in trade_history_urls:
+            try:
+                resp = await self.client.post(url, json=trade_payload)
+                if resp.status_code != 200:
+                    continue
+                body = resp.json()
+                if body.get("success") is False or (
+                    body.get("code") and str(body.get("code")) != "000000"
+                ):
+                    continue
+                rows = self._extract_list_rows(body.get("data"))
+                if rows is None:
+                    continue
+                if not rows:
+                    saw_valid_empty = True
+                    break
+                fills = self._parse_fill_rows(rows)
+                if fills:
+                    fills.sort(key=lambda x: x.order_time_ms)
+                    return aggregate_burst_fills(fills)
+                saw_valid_empty = True
+                break
+            except Exception as exc:
+                logger.debug("trade-history fallback error (%s): %s", url, exc)
+
+        # 3. Last-resort fallback: `position-history`
+        payload_paged = {
+            "portfolioId": portfolio_id,
+            "pageNumber": 1,
+            "pageSize": 10,
+        }
         for base in (COPY_TRADE_FRIENDLY, COPY_TRADE_PUBLIC):
             url = f"{base}/lead-portfolio/position-history"
             try:
@@ -844,7 +893,7 @@ class BinanceCopyTracker:
             self._positions_cache[portfolio_id] = curr_map
             return (False, evs, [])
 
-        raw_fills = await self.fetch_recent_orders(portfolio_id, limit=50, merge_bursts=False)
+        raw_fills = await self.fetch_recent_orders(portfolio_id, limit=20, merge_bursts=False)
         is_first = not self._initialized.get(portfolio_id, False)
         seen_ids = self._seen_order_ids.setdefault(portfolio_id, set())
 
@@ -857,7 +906,7 @@ class BinanceCopyTracker:
                 seen_ids.add(f.order_id)
                 baseline_ts = max(baseline_ts, f.order_time_ms)
             self._last_order_time_ms[portfolio_id] = baseline_ts
-            return (True, [], aggregate_burst_fills(raw_fills))
+            return (True, [], raw_fills)
 
         if raw_fills is None:
             return (False, [], None)
@@ -875,14 +924,11 @@ class BinanceCopyTracker:
                         self._last_order_time_ms[portfolio_id] = f.order_time_ms
                     new_raw.append(f)
 
-        events = [
-            fill_to_event(portfolio_id, trader_name, mf)
-            for mf in aggregate_burst_fills(new_raw)
-        ]
+        events = [fill_to_event(portfolio_id, trader_name, f) for f in new_raw]
 
         if len(seen_ids) > 1000:
             # Retain recent order IDs so memory never grows unbounded
             recent_keep = {f.order_id for f in raw_fills}
             self._seen_order_ids[portfolio_id] = recent_keep
 
-        return (False, events, aggregate_burst_fills(raw_fills))
+        return (False, events, raw_fills)
