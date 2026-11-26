@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -349,12 +350,16 @@ class BinanceCopyTracker:
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             ),
-            "Accept": "application/json, text/plain, */*",
+            "Accept": "*/*",
+            "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
             "Content-Type": "application/json",
             "clienttype": "web",
             "lang": "zh-TC",
+            "bnc-uuid": str(uuid.uuid4()),
+            "bnc-time-zone": "Asia/Taipei",
+            "bnc-location": "",
             "Origin": BINANCE_WEB_BASE,
             "Referer": f"{BINANCE_WEB_BASE}/zh-TC/copy-trading",
         }
@@ -638,19 +643,15 @@ class BinanceCopyTracker:
             return None
 
         now_ms = int(time.time() * 1000)
-        start_7d_ms = now_ms - 7 * 86400 * 1000
-        start_30d_ms = now_ms - 30 * 86400 * 1000
-        safe_page_size = max(5, min(20, limit))
+        # Exact 101-byte payload used by Binance Web UI `最新紀錄` tab (`pageSize: 10`, 7D window, no pageNumber)
+        start_7d_ms = now_ms - 7 * 86400 * 1000 + 60_000
+        start_30d_ms = now_ms - 30 * 86400 * 1000 + 60_000
 
         order_history_payloads = [
             {
                 "portfolioId": portfolio_id,
                 "startTime": start_7d_ms,
                 "endTime": now_ms,
-                "pageSize": safe_page_size,
-            },
-            {
-                "portfolioId": portfolio_id,
                 "pageSize": 10,
             },
             {
@@ -658,14 +659,12 @@ class BinanceCopyTracker:
                 "startTime": start_30d_ms,
                 "endTime": now_ms,
                 "pageSize": 10,
-                "pageNumber": 1,
             },
         ]
 
         order_history_urls = [
             f"{COPY_TRADE_FRIENDLY}/lead-portfolio/order-history",
             f"{COPY_TRADE_PUBLIC}/lead-portfolio/order-history",
-            f"{COPY_TRADE_FRIENDLY}/lead-data/order-history",
         ]
 
         saw_valid_empty = False
@@ -674,13 +673,19 @@ class BinanceCopyTracker:
         for url in order_history_urls:
             for req_body in order_history_payloads:
                 try:
-                    resp = await self.client.post(url, json=req_body)
+                    resp = await self.client.post(
+                        url,
+                        json=req_body,
+                        headers={"Referer": f"{BINANCE_WEB_BASE}/zh-TC/copy-trading/lead-details/{portfolio_id}"},
+                    )
                     if resp.status_code != 200:
+                        logger.info("order-history status=%s on %s: %s", resp.status_code, url, resp.text[:200])
                         continue
                     body = resp.json()
                     if body.get("success") is False or (
                         body.get("code") and str(body.get("code")) != "000000"
                     ):
+                        logger.info("order-history code=%s msg=%s", body.get("code"), body.get("message"))
                         continue
                     rows = self._extract_list_rows(body.get("data"))
                     if rows is None:
