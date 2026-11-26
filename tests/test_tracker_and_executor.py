@@ -107,10 +107,11 @@ class TestBinanceCopyBotSuite(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ev_open[0].action, "OPEN")
         self.assertEqual(ev_open[0].ref_price, 92000.0)
 
+        ev_open[0].trader_margin_balance = 92000.0
         html_msg = format_position_event_html(ev_open[0], exec_note="📝 測試限價單")
-        self.assertIn("買入開多", html_msg)
-        self.assertIn("BTCUSDT", html_msg)
+        self.assertIn("開多 BTCUSDT", html_msg)
         self.assertIn("92,000.00", html_msg)
+        self.assertIn("50.0%", html_msg)
         self.assertIn("📝 測試限價單", html_msg)
 
         curr_2 = {
