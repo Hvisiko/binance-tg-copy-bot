@@ -192,7 +192,7 @@ def format_recent_trades_html(
 
         lines.append(
             f"<code>{dt_str}</code> {icon}{act_label} <b>{coin}</b> "
-            f"@<code>{_fmt_price(f.avg_price)}</code> ｜ 倉位 <code>{pct_str}</code>{pnl_suffix}"
+            f"@<code>{_fmt_price(f.avg_price)}</code> · <code>{pct_str}</code>{pnl_suffix}"
         )
     return "\n".join(lines)
 
@@ -648,15 +648,13 @@ class TelegramBotController:
             return
 
         items = list(self.cfg.tracked_portfolios.items())
-
-        async def _fetch_one(pid: str, name: str) -> str:
-            prof, fills = await asyncio.gather(
-                self.tracker.get_cached_profile(pid, fallback_name=name),
-                self.tracker.fetch_recent_orders(pid, limit=10, merge_bursts=False),
-            )
-            return format_recent_trades_html(prof, fills, max_items=5)
-
-        blocks = await asyncio.gather(*[_fetch_one(pid, name) for pid, name in items])
+        blocks: List[str] = []
+        for idx, (pid, name) in enumerate(items):
+            if idx > 0:
+                await asyncio.sleep(0.2)
+            prof = await self.tracker.get_cached_profile(pid, fallback_name=name)
+            fills = await self.tracker.fetch_recent_orders(pid, limit=10, merge_bursts=False)
+            blocks.append(format_recent_trades_html(prof, fills, max_items=5))
         header = "📜 <b>最新交易紀錄</b> <i>(倉位佔交易員總本金%)</i>\n━━━━━━━━━━━━━━\n"
         sep = "\n──────────────\n"
         kb = {
