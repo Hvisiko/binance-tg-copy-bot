@@ -23,6 +23,7 @@ LEADERBOARD_PUBLIC_V1 = f"{BINANCE_WEB_BASE}/bapi/futures/v1/public/future/leade
 class TraderProfile:
     portfolio_id: str
     nickname: str
+    margin_balance: Optional[float] = None
     roi_30d: Optional[float] = None
     pnl_30d: Optional[float] = None
     aum: Optional[float] = None
@@ -100,6 +101,7 @@ class PositionEvent:
     order_side: str = ""  # "BUY" or "SELL"
     order_type: str = "LIMIT"
     order_id: str = ""
+    trader_margin_balance: Optional[float] = None
 
 
 def _safe_float(val: Any, default: Optional[float] = 0.0) -> Optional[float]:
@@ -179,7 +181,11 @@ def aggregate_burst_fills(
 
 
 def fill_to_event(
-    portfolio_id: str, trader_name: str, fill: TraderOrderFill, default_leverage: int = 10
+    portfolio_id: str,
+    trader_name: str,
+    fill: TraderOrderFill,
+    default_leverage: int = 10,
+    trader_margin_balance: Optional[float] = None,
 ) -> PositionEvent:
     action, p_side = fill.infer_action_and_pos_side()
     is_opening = action == "OPEN"
@@ -201,6 +207,7 @@ def fill_to_event(
         order_side=fill.side,
         order_type=fill.order_type,
         order_id=fill.order_id,
+        trader_margin_balance=trader_margin_balance,
     )
 
 
@@ -376,6 +383,7 @@ class BinanceCopyTracker:
         self._seen_order_ids: Dict[str, set[str]] = {}
         self._last_order_time_ms: Dict[str, int] = {}
         self._positions_cache: Dict[str, Dict[Tuple[str, str], TraderPosition]] = {}
+        self._profile_cache: Dict[str, Tuple[float, TraderProfile]] = {}
 
     async def close(self) -> None:
         if self._owns_client:
@@ -514,9 +522,24 @@ class BinanceCopyTracker:
                         or data.get("name")
                         or f"Trader-{portfolio_id[-6:]}"
                     )
-                    return TraderProfile(
+                    margin_bal = _safe_float(data.get("marginBalance"), None)
+                    if (margin_bal is None or margin_bal <= 0) and (
+                        data.get("aumAmount") is not None and data.get("copyAum") is not None
+                    ):
+                        diff_bal = _safe_float_val(data.get("aumAmount"), 0.0) - _safe_float_val(
+                            data.get("copyAum"), 0.0
+                        )
+                        if diff_bal > 0:
+                            margin_bal = diff_bal
+                    if margin_bal is None or margin_bal <= 0:
+                        margin_bal = _safe_float(
+                            data.get("aumAmount") or data.get("currentCopyAmount"), None
+                        )
+
+                    prof = TraderProfile(
                         portfolio_id=portfolio_id,
                         nickname=nick,
+                        margin_balance=margin_bal,
                         roi_30d=_safe_float(data.get("roi"), None),
                         pnl_30d=_safe_float(
                             data.get("pnl") or data.get("netProfitAmount"), None
@@ -528,14 +551,30 @@ class BinanceCopyTracker:
                         win_rate=_safe_float(data.get("winRate"), None),
                         url=self.build_trader_url(portfolio_id),
                     )
+                    self._profile_cache[portfolio_id] = (time.time(), prof)
+                    return prof
             except Exception as exc:
                 logger.debug("fetch_trader_detail error (%s): %s", url, exc)
 
-        return TraderProfile(
+        fallback = TraderProfile(
             portfolio_id=portfolio_id,
             nickname=f"Trader-{portfolio_id[-6:]}",
             url=self.build_trader_url(portfolio_id),
         )
+        return fallback
+
+    async def get_cached_profile(
+        self, portfolio_id: str, fallback_name: str = "", ttl_sec: float = 300.0
+    ) -> TraderProfile:
+        now = time.time()
+        cached = self._profile_cache.get(portfolio_id)
+        if cached and (now - cached[0]) < ttl_sec and cached[1].margin_balance:
+            return cached[1]
+        prof = await self.fetch_trader_detail(portfolio_id)
+        if fallback_name and prof.nickname.startswith("Trader-"):
+            prof.nickname = fallback_name
+        self._profile_cache[portfolio_id] = (now, prof)
+        return prof
 
     @staticmethod
     def _extract_list_rows(data: Any) -> Optional[List[Dict[str, Any]]]:
@@ -929,7 +968,16 @@ class BinanceCopyTracker:
                         self._last_order_time_ms[portfolio_id] = f.order_time_ms
                     new_raw.append(f)
 
-        events = [fill_to_event(portfolio_id, trader_name, f) for f in new_raw]
+        prof = await self.get_cached_profile(portfolio_id, fallback_name=trader_name)
+        events = [
+            fill_to_event(
+                portfolio_id,
+                trader_name,
+                f,
+                trader_margin_balance=prof.margin_balance,
+            )
+            for f in new_raw
+        ]
 
         if len(seen_ids) > 1000:
             # Retain recent order IDs so memory never grows unbounded

@@ -5,7 +5,7 @@ import hashlib
 import html
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -16,7 +16,7 @@ from .binance_tracker import (
     TraderOrderFill,
     TraderProfile,
 )
-from .config import AppConfig, extract_portfolio_id
+from .config import AppConfig
 from .key_utils import generate_ed25519_keypair
 
 logger = logging.getLogger(__name__)
@@ -25,12 +25,53 @@ TZ_TAIPEI = timezone(timedelta(hours=8))
 MAX_TG_MESSAGE_LEN = 3900
 
 
-def _fmt_num(val: float) -> str:
+def _fmt_price(val: float) -> str:
     if abs(val) >= 1000:
         return f"{val:,.2f}"
     if abs(val) >= 1:
         return f"{val:,.4f}".rstrip("0").rstrip(".")
     return f"{val:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def _fmt_pct(pct: float) -> str:
+    ap = abs(pct)
+    if ap >= 100:
+        return f"{pct:,.0f}%"
+    if ap >= 10:
+        return f"{pct:.1f}%"
+    if ap >= 1:
+        return f"{pct:.1f}%"
+    if ap >= 0.01:
+        return f"{pct:.2f}%"
+    if ap > 0:
+        return "<0.01%" if pct > 0 else ">-0.01%"
+    return "0%"
+
+
+def _fmt_compact_usd(val: float) -> str:
+    av = abs(val)
+    sign = "-" if val < 0 else ""
+    if av >= 1_000_000:
+        return f"{sign}${av / 1_000_000:.2f}M"
+    if av >= 10_000:
+        return f"{sign}${av / 1_000:.1f}K"
+    if av >= 100:
+        return f"{sign}${av:,.0f}"
+    return f"{sign}${av:,.2f}"
+
+
+def _short_coin(symbol: str) -> str:
+    s = symbol.upper()
+    if s.endswith("USDT") and len(s) > 4:
+        return s[:-4]
+    return s
+
+
+def _calc_pos_pct_label(notional_usdt: float, margin_balance: Optional[float]) -> str:
+    if margin_balance is not None and margin_balance > 1.0:
+        pct = (notional_usdt / margin_balance) * 100.0
+        return _fmt_pct(pct)
+    return _fmt_compact_usd(notional_usdt)
 
 
 def split_html_chunks(text: str, max_len: int = MAX_TG_MESSAGE_LEN) -> List[str]:
@@ -53,46 +94,57 @@ def split_html_chunks(text: str, max_len: int = MAX_TG_MESSAGE_LEN) -> List[str]
     return chunks
 
 
-def _describe_trade_direction(action: str, position_side: str, order_side: str = "") -> str:
+def _action_badge(action: str, position_side: str) -> Tuple[str, str, bool]:
+    """Returns (emoji, short_label, is_open)."""
     if action in ("OPEN", "INCREASE"):
         if position_side == "LONG":
-            return "🟢 買入開多 (BUY · LONG)"
-        return "🔴 賣出開空 (SELL · SHORT)"
+            return "🟢", "開多", True
+        return "🔴", "開空", True
     if position_side == "LONG":
-        return "⚪ 賣出平多 (SELL · 平多)"
-    return "⚪ 買入平空 (BUY · 平空)"
+        return "⚪", "平多", False
+    return "⚪", "平空", False
 
 
 def format_position_event_html(event: PositionEvent, exec_note: str = "") -> str:
-    """Format a newly detected trader execution record into a clean Telegram HTML card."""
-    dir_badge = _describe_trade_direction(
-        event.action, event.position_side, event.order_side
-    )
+    """Format a newly detected trader execution record into a sleek, percentage-based Telegram card."""
+    icon, act_label, is_open = _action_badge(event.action, event.position_side)
     ts_sec = (
         (event.event_time_ms / 1000.0)
         if event.event_time_ms > 0
         else datetime.now().timestamp()
     )
-    dt_str = datetime.fromtimestamp(ts_sec, tz=TZ_TAIPEI).strftime("%Y-%m-%d %H:%M:%S")
+    dt_str = datetime.fromtimestamp(ts_sec, tz=TZ_TAIPEI).strftime("%m-%d %H:%M:%S")
     url = BinanceCopyTracker.build_trader_url(event.portfolio_id)
     safe_name = html.escape(event.trader_name)
 
     notional_val = event.ref_price * event.delta_qty
+    pct_str = _calc_pos_pct_label(notional_val, event.trader_margin_balance)
+    price_title = "成交均價" if is_open else "平倉均價"
+    size_title = "倉位佔比" if is_open else "平倉佔比"
+    type_tag = f"  <code>{html.escape(event.order_type)}</code>" if event.order_type else ""
+
     lines = [
-        f"⚡ <b>最新成交快訊</b> ｜ <b>{html.escape(event.symbol)}</b>",
-        f"📌 動作：{dir_badge}",
-        f"👤 交易員：<a href=\"{url}\">{safe_name}</a> (<code>{event.portfolio_id}</code>)",
-        f"💰 成交均價：<code>{_fmt_num(event.ref_price)}</code> USDT",
-        f"📦 成交數量：<code>{_fmt_num(event.delta_qty)}</code>（總價值 <code>{notional_val:,.2f} U</code>"
-        + (f"｜<code>{html.escape(event.order_type)}</code>）" if event.order_type else "）"),
+        f"{icon} <b>{act_label} {html.escape(event.symbol)}</b>{type_tag}",
+        f"👤 <a href=\"{url}\"><b>{safe_name}</b></a>",
+        "━━━━━━━━━━━━━━",
+        f"💰 {price_title}：<code>{_fmt_price(event.ref_price)}</code>",
+        f"📊 {size_title}：<code>{pct_str}</code>",
     ]
 
     if event.realized_pnl is not None and abs(event.realized_pnl) > 1e-9:
         pnl_emoji = "🤑" if event.realized_pnl >= 0 else "💸"
-        pnl_sign = "+" if event.realized_pnl >= 0 else ""
-        lines.append(f"{pnl_emoji} 已實現盈虧：<code>{pnl_sign}{event.realized_pnl:,.2f} USDT</code>")
+        sign = "+" if event.realized_pnl >= 0 else ""
+        if event.trader_margin_balance and event.trader_margin_balance > 1.0:
+            ret_pct = (event.realized_pnl / event.trader_margin_balance) * 100.0
+            lines.append(
+                f"{pnl_emoji} 本金損益：<code>{sign}{_fmt_pct(ret_pct)}</code> <i>({sign}{_fmt_compact_usd(event.realized_pnl)})</i>"
+            )
+        else:
+            lines.append(
+                f"{pnl_emoji} 實現盈虧：<code>{sign}{_fmt_compact_usd(event.realized_pnl)}</code>"
+            )
 
-    lines.append(f"🕒 成交時間：{dt_str} (UTC+8)")
+    lines.append(f"🕒 成交時間：<code>{dt_str}</code>")
 
     if exec_note:
         lines.append("━━━━━━━━━━━━━━")
@@ -104,44 +156,43 @@ def format_position_event_html(event: PositionEvent, exec_note: str = "") -> str
 def format_recent_trades_html(
     profile: TraderProfile, fills: Optional[List[TraderOrderFill]], max_items: int = 5
 ) -> str:
-    """Format a trader's latest executed trade records (newest first)."""
+    """Format a trader's latest executed trade records cleanly using % of total portfolio."""
     safe_name = html.escape(profile.nickname)
-    header = f"👤 <b><a href=\"{profile.url}\">{safe_name}</a></b> (<code>{profile.portfolio_id}</code>)"
+    header = f"👤 <a href=\"{profile.url}\"><b>{safe_name}</b></a>"
     if fills is None:
-        return (
-            f"{header}\n"
-            "⚠️ 暫時無法讀取該交易員公開交易紀錄（若該交易員限制僅登入可見，可在環境變數設定 <code>BINANCE_WEB_COOKIE</code>）。"
-        )
+        return f"{header}\n  <i>⚠️ 暫時無法讀取公開交易紀錄</i>"
     if not fills:
-        return f"{header}\n📭 近 30 日尚無公開成交紀錄（一有新成交將立即推播）。"
+        return f"{header}\n  <i>📭 近期尚無公開成交紀錄</i>"
 
-    # Sort newest first for display
     recent = sorted(fills, key=lambda x: x.order_time_ms, reverse=True)[:max_items]
-    lines = [f"{header}\n📜 <b>最新 {len(recent)} 筆交易紀錄：</b>"]
+    lines = [header]
     for f in recent:
         action, p_side = f.infer_action_and_pos_side()
-        if action == "OPEN":
-            tag = "🟢開多" if p_side == "LONG" else "🔴開空"
-        else:
-            tag = "⚪平多" if p_side == "LONG" else "⚪平空"
-
+        icon, act_label, _ = _action_badge(action, p_side)
         dt_str = (
             datetime.fromtimestamp(f.order_time_ms / 1000.0, tz=TZ_TAIPEI).strftime(
-                "%m-%d %H:%M:%S"
+                "%m-%d %H:%M"
             )
             if f.order_time_ms > 0
-            else "--"
+            else "--:--"
         )
-        pnl_part = ""
-        if abs(f.realized_pnl) > 1e-9:
-            sign = "+" if f.realized_pnl >= 0 else ""
-            pnl_part = f" ｜ 盈虧 <code>{sign}{f.realized_pnl:,.2f} U</code>"
-
         notional_u = f.avg_price * f.executed_qty
-        qty_disp = f"{f.executed_qty:,.4f}".rstrip("0").rstrip(".") if f.executed_qty >= 1 else _fmt_num(f.executed_qty)
+        pct_str = _calc_pos_pct_label(notional_u, profile.margin_balance)
+        coin = html.escape(_short_coin(f.symbol))
+
+        pnl_suffix = ""
+        if abs(f.realized_pnl) > 1e-9:
+            p_icon = "🤑" if f.realized_pnl >= 0 else "💸"
+            sign = "+" if f.realized_pnl >= 0 else ""
+            if profile.margin_balance and profile.margin_balance > 1.0:
+                rpct = (f.realized_pnl / profile.margin_balance) * 100.0
+                pnl_suffix = f" {p_icon}<code>{sign}{_fmt_pct(rpct)}</code>"
+            else:
+                pnl_suffix = f" {p_icon}<code>{sign}{_fmt_compact_usd(f.realized_pnl)}</code>"
+
         lines.append(
-            f"• <code>{dt_str}</code> ｜ <b>{html.escape(f.symbol)}</b> {tag} (<code>{html.escape(f.order_type)}</code>)\n"
-            f"  均價 <code>{_fmt_num(f.avg_price)}</code> × 數量 <code>{qty_disp}</code>（價值 <code>{notional_u:,.2f} U</code>）{pnl_part}"
+            f"<code>{dt_str}</code> {icon}{act_label} <b>{coin}</b> "
+            f"@<code>{_fmt_price(f.avg_price)}</code> ｜ 倉位 <code>{pct_str}</code>{pnl_suffix}"
         )
     return "\n".join(lines)
 
@@ -207,14 +258,15 @@ class TelegramBotController:
         return {
             "inline_keyboard": [
                 [
-                    {"text": "🏆 熱門帶單排行", "callback_data": "cb_menu:top"},
                     {"text": "📜 最新交易紀錄", "callback_data": "cb_menu:trades"},
+                    {"text": "🏆 熱門帶單排行", "callback_data": "cb_menu:top"},
                 ],
                 [
-                    {"text": "💼 我的帳戶／掛單", "callback_data": "cb_menu:my"},
+                    {"text": "🎛️ 管理監控名單", "callback_data": "cb_menu:manage"},
                     {"text": "⚙️ 跟單參數設定", "callback_data": "cb_menu:settings"},
                 ],
                 [
+                    {"text": "💼 我的帳戶／掛單", "callback_data": "cb_menu:my"},
                     {"text": toggle_label, "callback_data": "cb_menu:toggle_auto"},
                 ],
             ]
@@ -280,10 +332,10 @@ class TelegramBotController:
                 pass
         commands = [
             {"command": "start", "description": "開啟互動控制面板與系統狀態"},
+            {"command": "trades", "description": "查看所有追蹤中交易員的最新交易與倉位佔比"},
             {"command": "top", "description": "查詢幣安 30 日高收益帶單員（附一鍵追蹤按鈕）"},
             {"command": "add", "description": "新增追蹤帶單員（貼網址或 portfolioId）"},
             {"command": "remove", "description": "移除追蹤中的帶單員"},
-            {"command": "trades", "description": "查看所有追蹤中交易員的最新成交紀錄"},
             {"command": "my", "description": "查看我的幣安合約餘額、持倉與待成交限價單"},
             {"command": "set", "description": "即時檢視或修改保證金、槓桿、滑點與超時秒數"},
             {"command": "autotrading", "description": "切換「限價自動跟單」開關"},
@@ -372,6 +424,8 @@ class TelegramBotController:
             await self._cmd_top(chat_id)
         elif data in ("cb_menu:trades", "cb_menu:positions"):
             await self._cmd_trades(chat_id)
+        elif data == "cb_menu:manage":
+            await self._cmd_manage(chat_id)
         elif data == "cb_menu:my":
             await self._cmd_my_account(chat_id)
         elif data == "cb_menu:settings":
@@ -402,9 +456,9 @@ class TelegramBotController:
 
         # Allow pasting a Binance copy-trading URL (or App QR short-link) directly without typing `/add`!
         if not text.startswith("/"):
-            if any(h in text.lower() for h in ("binance.com", "binance.me", "safu.im")) and self._authorize_actor(
-                chat_id, from_user_id
-            ):
+            if any(
+                h in text.lower() for h in ("binance.com", "binance.me", "safu.im")
+            ) and self._authorize_actor(chat_id, from_user_id):
                 resolved_pid = await self.tracker.resolve_portfolio_id(text)
                 if resolved_pid:
                     await self._cmd_add(chat_id, resolved_pid)
@@ -429,6 +483,8 @@ class TelegramBotController:
             await self._cmd_remove(chat_id, arg)
         elif cmd in ("/trades", "/history", "/positions", "/list"):
             await self._cmd_trades(chat_id)
+        elif cmd == "/manage":
+            await self._cmd_manage(chat_id)
         elif cmd in ("/my", "/account", "/orders", "/balance"):
             await self._cmd_my_account(chat_id)
         elif cmd == "/cancelall":
@@ -448,59 +504,80 @@ class TelegramBotController:
 
     async def _cmd_start(self, chat_id: str, _chat_type: str = "private") -> None:
         mode_str = (
-            "🟢 <b>自動限價跟單＋最新成交推播</b>"
+            "🟢 <b>自動限價跟單＋即時推播</b>"
             if self.cfg.enable_auto_trade
-            else "🔔 <b>純最新交易紀錄推播（安全唯讀）</b>"
+            else "🔔 <b>即時成交推播中</b> <i>(安全唯讀)</i>"
         )
         tracked_lines = [
-            f"  • {html.escape(name)} (<code>{pid}</code>)"
-            for pid, name in self.cfg.tracked_portfolios.items()
+            f"  {idx}. <a href=\"{BinanceCopyTracker.build_trader_url(pid)}\"><b>{html.escape(name)}</b></a>"
+            for idx, (pid, name) in enumerate(self.cfg.tracked_portfolios.items(), 1)
         ]
         tracked_block = (
             "\n".join(tracked_lines)
             if tracked_lines
-            else "  （尚未新增，點下方按鈕或直接貼上幣安帶單網址即可追蹤！）"
+            else "  <i>（尚未新增，點下方排行或直接貼上帶單網址即可追蹤）</i>"
         )
         reply = (
-            "🤖 <b>幣安交易員「最新交易紀錄」即時追蹤 ＆ 限價跟單機器人</b>\n\n"
-            f"📌 當前模式：{mode_str}\n"
-            f"⚡ 追蹤機制：直接監控<b>最新成交紀錄（Order / Trade History）</b>，即使交易員隱藏持倉也能抓到每一筆新成交！\n"
-            f"⏱️ 掃描頻率：每 <code>{self.cfg.poll_interval_sec:.0f}</code> 秒\n"
-            f"💰 跟單配置：單筆保證金 <code>{self.cfg.trade_margin_usdt:g} U</code> × <code>{self.cfg.trade_leverage}x</code>\n"
-            f"🎯 限價策略：<code>{self.cfg.limit_order_mode}</code>（滑點上限 <code>{self.cfg.limit_slippage_pct}%</code>｜"
-            f"超時 <code>{self.cfg.limit_order_timeout_sec}s</code> 撤單｜平倉 <code>{self.cfg.exit_order_type}</code>）\n\n"
-            f"👀 <b>監控名單（{len(self.cfg.tracked_portfolios)} 位）：</b>\n{tracked_block}"
+            "🤖 <b>幣安帶單「最新紀錄」即時雷達</b>\n"
+            "━━━━━━━━━━━━━━\n"
+            f"📡 狀態：{mode_str}\n"
+            f"⏱️ 掃描：每 <code>{self.cfg.poll_interval_sec:.0f}s</code> ｜ 顯示<b>佔總倉位百分比</b>\n"
+            f"⚙️ 跟單：<code>{self.cfg.limit_order_mode}</code> ｜ <code>{self.cfg.trade_margin_usdt:g}U × {self.cfg.trade_leverage}x</code> ｜ 滑點 <code>{self.cfg.limit_slippage_pct}%</code>\n\n"
+            f"👀 <b>監控名單（{len(self.cfg.tracked_portfolios)} 位）</b>\n{tracked_block}"
         )
         await self.send_message(reply, chat_id=chat_id, reply_markup=self._main_menu_keyboard())
 
-    async def _cmd_top(self, chat_id: str) -> None:
-        await self.send_message("🔍 正在從幣安抓取近 30 日高收益公開帶單員...", chat_id=chat_id)
-        top_list = await self.tracker.fetch_top_portfolios(limit=5)
-        if not top_list:
-            await self.send_message(
-                "⚠️ 暫時無法取得排行榜清單（請確認雲端節點網路狀態）。",
-                chat_id=chat_id,
-            )
+    async def _cmd_manage(self, chat_id: str) -> None:
+        if not self.cfg.tracked_portfolios:
+            await self.send_message("📭 目前監控名單為空，可直接貼上幣安帶單網址新增。", chat_id=chat_id)
             return
 
-        lines = ["🏆 <b>幣安合約跟單 30 日高收益公開交易員</b>\n"]
+        lines = [
+            "🎛️ <b>管理監控名單</b>",
+            "━━━━━━━━━━━━━━",
+            "點擊下方按鈕可取消追蹤，或直接把新的幣安帶單網址貼進對話框即可新增：",
+        ]
+        items = list(self.cfg.tracked_portfolios.items())
+        kb_rows: List[List[Dict[str, str]]] = []
+        row: List[Dict[str, str]] = []
+        for pid, name in items:
+            row.append({"text": f"🗑️ {name[:12]}", "callback_data": f"cb_rm:{pid}"})
+            if len(row) == 2:
+                kb_rows.append(row)
+                row = []
+        if row:
+            kb_rows.append(row)
+        kb_rows.append([{"text": "⬅️ 返回主選單", "callback_data": "cb_menu:start"}])
+
+        await self.send_message(
+            "\n".join(lines),
+            chat_id=chat_id,
+            reply_markup={"inline_keyboard": kb_rows},
+        )
+
+    async def _cmd_top(self, chat_id: str) -> None:
+        await self.send_message("🔍 正在抓取幣安近 30 日高收益帶單員...", chat_id=chat_id)
+        top_list = await self.tracker.fetch_top_portfolios(limit=5)
+        if not top_list:
+            await self.send_message("⚠️ 暫時無法取得排行榜清單，請稍後再試。", chat_id=chat_id)
+            return
+
+        lines = ["🏆 <b>幣安跟單 30 日高收益排行</b>\n━━━━━━━━━━━━━━"]
         kb_rows: List[List[Dict[str, str]]] = []
 
         for idx, prof in enumerate(top_list, 1):
-            roi_txt = f"{prof.roi_30d:.1f}%" if prof.roi_30d is not None else "N/A"
-            pnl_txt = f"${prof.pnl_30d:,.0f}" if prof.pnl_30d is not None else "N/A"
-            already = "✅ 已追蹤" if prof.portfolio_id in self.cfg.tracked_portfolios else ""
+            roi_txt = f"+{prof.roi_30d:.1f}%" if prof.roi_30d is not None else "N/A"
+            pnl_txt = _fmt_compact_usd(prof.pnl_30d) if prof.pnl_30d is not None else "N/A"
+            already = " ✅" if prof.portfolio_id in self.cfg.tracked_portfolios else ""
             lines.append(
-                f"{idx}. <a href=\"{prof.url}\"><b>{html.escape(prof.nickname)}</b></a> {already}\n"
-                f"   30D ROI: <code>{roi_txt}</code> ｜ PNL: <code>{pnl_txt}</code>\n"
-                f"   ID: <code>{prof.portfolio_id}</code>"
+                f"{idx}. <a href=\"{prof.url}\"><b>{html.escape(prof.nickname)}</b></a>{already}\n"
+                f"   30D ROI <code>{roi_txt}</code> ｜ 獲利 <code>{pnl_txt}</code>"
             )
             if prof.portfolio_id not in self.cfg.tracked_portfolios:
-                btn_name = prof.nickname[:16]
                 kb_rows.append(
                     [
                         {
-                            "text": f"➕ 一鍵追蹤 {btn_name}",
+                            "text": f"➕ 一鍵追蹤 {prof.nickname[:16]}",
                             "callback_data": f"cb_add:{prof.portfolio_id}",
                         }
                     ]
@@ -513,9 +590,7 @@ class TelegramBotController:
         pid = await self.tracker.resolve_portfolio_id(arg)
         if not pid:
             await self.send_message(
-                "❓ 請提供幣安帶單員網址（支援電腦網頁或手機 App 分享短網址）或數字 ID，例如：\n"
-                "<code>/add https://www.binance.com/zh-TC/copy-trading/lead-details/5075281354358777856</code>\n"
-                "或點擊 <code>/top</code> 一鍵按鈕直接加入。",
+                "❓ 請直接貼上<b>幣安帶單員網址</b>（電腦版或手機 App 分享短網址皆可）或數字 ID！",
                 chat_id=chat_id,
             )
             return
@@ -527,43 +602,44 @@ class TelegramBotController:
         if wm > 0:
             self.cfg.last_order_time_ms[pid] = wm
         self.cfg.save_state()
+
         snap = format_recent_trades_html(profile, init_fills, max_items=5)
         markup = {
             "inline_keyboard": [
                 [
-                    {"text": "📜 查看全部最新成交", "callback_data": "cb_menu:trades"},
-                    {"text": "🗑️ 取消追蹤此人", "callback_data": f"cb_rm:{pid}"},
+                    {"text": "📜 查看全部最新紀錄", "callback_data": "cb_menu:trades"},
+                    {"text": "🗑️ 取消追蹤", "callback_data": f"cb_rm:{pid}"},
                 ]
             ]
         }
         await self.send_message(
-            f"✅ <b>已加入「最新交易紀錄」即時監控！</b>\n{snap}\n\n"
-            "💡 <i>已將上述歷史成交紀錄設為基準線（不會重複洗版舊單），接下來只要出現任何新的一筆成交紀錄，就會第一時間通知你！</i>",
+            f"✅ <b>已加入即時監控！</b>\n━━━━━━━━━━━━━━\n{snap}\n\n"
+            "<i>💡 歷史紀錄已設為基準，後續一有新成交將主動推播！</i>",
             chat_id=chat_id,
             reply_markup=markup,
         )
 
     async def _cmd_remove(self, chat_id: str, arg: str) -> None:
-        pid = extract_portfolio_id(arg) or arg.strip()
+        pid = await self.tracker.resolve_portfolio_id(arg) or arg.strip()
         if pid in self.cfg.tracked_portfolios:
             removed_name = self.cfg.tracked_portfolios.pop(pid)
             self.cfg.last_order_time_ms.pop(pid, None)
             self.cfg.save_state()
             self.tracker.remove_portfolio_state(pid)
             await self.send_message(
-                f"🗑️ 已停止追蹤 <b>{html.escape(removed_name)}</b> (<code>{pid}</code>)。",
+                f"🗑️ 已停止追蹤 <b>{html.escape(removed_name)}</b>。",
                 chat_id=chat_id,
             )
         else:
             await self.send_message(
-                f"⚠️ 監控名單中找不到 <code>{html.escape(pid)}</code>。",
+                f"⚠️ 名單中找不到 <code>{html.escape(pid)}</code>。",
                 chat_id=chat_id,
             )
 
     async def _cmd_trades(self, chat_id: str) -> None:
         if not self.cfg.tracked_portfolios:
             await self.send_message(
-                "📭 目前尚未追蹤任何交易員，請點選下方按鈕查看熱門排行或貼上帶單網址新增。",
+                "📭 目前尚未追蹤任何交易員，請點選下方按鈕挑選或直接貼上帶單網址新增。",
                 chat_id=chat_id,
                 reply_markup={
                     "inline_keyboard": [[{"text": "🏆 查看熱門帶單員", "callback_data": "cb_menu:top"}]]
@@ -571,27 +647,27 @@ class TelegramBotController:
             )
             return
 
-        blocks: List[str] = []
-        kb_rows: List[List[Dict[str, str]]] = [
-            [{"text": "🔄 重新整理最新交易紀錄", "callback_data": "cb_menu:trades"}]
-        ]
-        for pid, name in list(self.cfg.tracked_portfolios.items()):
-            prof = TraderProfile(
-                portfolio_id=pid,
-                nickname=name,
-                url=BinanceCopyTracker.build_trader_url(pid),
-            )
-            fills = await self.tracker.fetch_recent_orders(pid, limit=20, merge_bursts=False)
-            blocks.append(format_recent_trades_html(prof, fills, max_items=5))
-            kb_rows.append(
-                [{"text": f"🗑️ 停止追蹤 {name[:14]}", "callback_data": f"cb_rm:{pid}"}]
-            )
+        items = list(self.cfg.tracked_portfolios.items())
 
-        await self.send_message(
-            "\n\n".join(blocks),
-            chat_id=chat_id,
-            reply_markup={"inline_keyboard": kb_rows},
-        )
+        async def _fetch_one(pid: str, name: str) -> str:
+            prof, fills = await asyncio.gather(
+                self.tracker.get_cached_profile(pid, fallback_name=name),
+                self.tracker.fetch_recent_orders(pid, limit=10, merge_bursts=False),
+            )
+            return format_recent_trades_html(prof, fills, max_items=5)
+
+        blocks = await asyncio.gather(*[_fetch_one(pid, name) for pid, name in items])
+        header = "📜 <b>最新交易紀錄</b> <i>(倉位佔交易員總本金%)</i>\n━━━━━━━━━━━━━━\n"
+        sep = "\n──────────────\n"
+        kb = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔄 重新整理", "callback_data": "cb_menu:trades"},
+                    {"text": "🎛️ 管理名單", "callback_data": "cb_menu:manage"},
+                ]
+            ]
+        }
+        await self.send_message(header + sep.join(blocks), chat_id=chat_id, reply_markup=kb)
 
     async def _cmd_my_account(self, chat_id: str) -> None:
         summary = await self.executor.fetch_account_summary()
@@ -609,21 +685,17 @@ class TelegramBotController:
     async def _cmd_settings(self, chat_id: str, arg: str) -> None:
         if not arg:
             text = (
-                "⚙️ <b>目前限價跟單與風控參數</b>\n\n"
-                f"• 單筆開倉保證金 (<code>margin</code>)：<code>{self.cfg.trade_margin_usdt:g} USDT</code>\n"
-                f"• 單筆最大安全保證金上限 (<code>maxmargin</code>)：<code>{self.cfg.max_margin_usdt:g} USDT</code>\n"
-                f"• 合約槓桿倍數 (<code>leverage</code>)：<code>{self.cfg.trade_leverage}x</code>\n"
-                f"• 開倉限價模式 (<code>mode</code>)：<code>{self.cfg.limit_order_mode}</code>\n"
-                f"• 容許最大滑點 (<code>slippage</code>)：<code>{self.cfg.limit_slippage_pct}%</code>\n"
-                f"• 未成交自動撤單 (<code>timeout</code>)：<code>{self.cfg.limit_order_timeout_sec} 秒</code>\n"
-                f"• 平倉離場模式 (<code>exit</code>)：<code>{self.cfg.exit_order_type}</code>\n\n"
-                "✏️ <b>直接在手機修改參數範例（立即生效並自動存檔）：</b>\n"
-                "• <code>/set margin 30</code> — 單筆保證金改為 30 U\n"
-                "• <code>/set leverage 15</code> — 槓桿改為 15 倍\n"
-                "• <code>/set slippage 0.05</code> — 限價容忍滑點改為 0.05%（設 0 為嚴格同價）\n"
-                "• <code>/set timeout 120</code> — 120 秒未成交自動撤單\n"
-                "• <code>/set mode POST_ONLY_BBO</code> — 改掛買一/賣一 Maker 單\n"
-                "• <code>/set exit MARKET</code> — 平倉維持市價保命（或改 <code>LIMIT</code>）"
+                "⚙️ <b>限價跟單與風控參數</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                f"• 單筆保證金 (<code>margin</code>)：<code>{self.cfg.trade_margin_usdt:g} USDT</code>\n"
+                f"• 最大保證金上限 (<code>maxmargin</code>)：<code>{self.cfg.max_margin_usdt:g} USDT</code>\n"
+                f"• 合約槓桿 (<code>leverage</code>)：<code>{self.cfg.trade_leverage}x</code>\n"
+                f"• 限價模式 (<code>mode</code>)：<code>{self.cfg.limit_order_mode}</code>\n"
+                f"• 滑點上限 (<code>slippage</code>)：<code>{self.cfg.limit_slippage_pct}%</code>\n"
+                f"• 超時撤單 (<code>timeout</code>)：<code>{self.cfg.limit_order_timeout_sec}s</code>\n"
+                f"• 平倉模式 (<code>exit</code>)：<code>{self.cfg.exit_order_type}</code>\n\n"
+                "✏️ <b>快速修改範例：</b>\n"
+                "<code>/set margin 30</code> ｜ <code>/set leverage 15</code> ｜ <code>/set slippage 0.05</code>"
             )
             await self.send_message(text, chat_id=chat_id)
             return
@@ -697,8 +769,8 @@ class TelegramBotController:
             if not self.cfg.has_trading_credentials():
                 await self.send_message(
                     "⚠️ <b>尚未設定幣安 API 金鑰，無法開啟自動跟單！</b>\n\n"
-                    "1️⃣ 若你在雲端託管（無固定 IP），可直接在私訊輸入 <code>/genkey</code> 一鍵產生 Ed25519 公私鑰。\n"
-                    "2️⃣ 將公鑰貼到幣安後台開啟「合約權限」，再把 <code>BINANCE_API_KEY</code> 與 <code>BINANCE_ED25519_PRIVATE_KEY</code> 填入雲端環境變數重啟即可！",
+                    "1️⃣ 在一對一私訊輸入 <code>/genkey</code> 一鍵產生免綁 IP 的 Ed25519 公私鑰。\n"
+                    "2️⃣ 將公鑰貼到幣安後台開啟「合約權限」，再把 <code>BINANCE_API_KEY</code> 與 <code>BINANCE_ED25519_PRIVATE_KEY</code> 填入 Render 環境變數即可！",
                     chat_id=chat_id,
                 )
                 return
@@ -706,24 +778,22 @@ class TelegramBotController:
             self.cfg.save_state()
             await self.send_message(
                 "🟢 <b>已開啟「限價單自動跟單」模式！</b>\n"
-                f"• 單筆保證金：<code>{self.cfg.trade_margin_usdt:g} USDT</code> × <code>{self.cfg.trade_leverage}x</code>\n"
-                f"• 開倉模式：<code>{self.cfg.limit_order_mode}</code>（滑點上限 <code>{self.cfg.limit_slippage_pct}%</code>）\n"
-                f"• 超時撤單：<code>{self.cfg.limit_order_timeout_sec}</code> 秒",
+                f"• 配置：<code>{self.cfg.trade_margin_usdt:g} USDT</code> × <code>{self.cfg.trade_leverage}x</code>\n"
+                f"• 策略：<code>{self.cfg.limit_order_mode}</code>（滑點上限 <code>{self.cfg.limit_slippage_pct}%</code>｜超時 <code>{self.cfg.limit_order_timeout_sec}s</code> 撤單）",
                 chat_id=chat_id,
             )
         elif sub in ("off", "false", "0"):
             self.cfg.enable_auto_trade = False
             self.cfg.save_state()
             await self.send_message(
-                "🔔 已切換回「<b>純最新交易紀錄通知模式</b>」（不執行自動下單）。",
+                "🔔 已切換回「<b>純即時通知模式</b>」（不執行自動下單）。",
                 chat_id=chat_id,
             )
         else:
             state_txt = "開啟中 🟢" if self.cfg.enable_auto_trade else "關閉中（純通知） 🔔"
             toggle_btn = "🔔 關閉自動跟單" if self.cfg.enable_auto_trade else "🟢 開啟自動跟單"
             await self.send_message(
-                f"目前自動限價跟單狀態：{state_txt}\n"
-                "切換指令：<code>/autotrading on</code> 或 <code>/autotrading off</code>",
+                f"目前自動限價跟單狀態：{state_txt}",
                 chat_id=chat_id,
                 reply_markup={
                     "inline_keyboard": [[{"text": toggle_btn, "callback_data": "cb_menu:toggle_auto"}]]
@@ -741,11 +811,11 @@ class TelegramBotController:
         pub_pem, _, env_priv = generate_ed25519_keypair()
         msg = (
             "🔑 <b>已為你即時產生免綁 IP 專用 Ed25519 金鑰組！</b>\n\n"
-            "<b>步驟 1：複製下方公鑰貼到幣安「建立自生成 API 金鑰」</b>（點擊區塊即可複製）：\n"
+            "<b>步驟 1：複製下方公鑰貼到幣安「建立自生成 API 金鑰」</b>：\n"
             f"<code>{html.escape(pub_pem)}</code>\n\n"
-            "<b>步驟 2：勾選「啟用合約」（切勿勾選提現！），將拿到的 API Key 與下方私鑰填入 Render 環境變數：</b>\n"
+            "<b>步驟 2：勾選「啟用合約」（切勿勾選提現！），將 API Key 與下方私鑰填入 Render 環境變數：</b>\n"
             f"<code>{html.escape(env_priv)}</code>\n"
-            "<i>（變數名稱請填 <code>BINANCE_ED25519_PRIVATE_KEY</code>）</i>\n\n"
-            "⚠️ <b>安全提醒：複製貼進 Render 後，請長按刪除本則 Telegram 訊息，機器人不會留存此私鑰紀錄！</b>"
+            "<i>（變數名稱：<code>BINANCE_ED25519_PRIVATE_KEY</code>）</i>\n\n"
+            "⚠️ <b>安全提醒：貼進 Render 後請長按刪除本則訊息！</b>"
         )
         await self.send_message(msg, chat_id=chat_id)
